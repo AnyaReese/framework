@@ -1,0 +1,762 @@
+# gpt_cls.py (patched; key change: per-candidate return strategies)
+
+"""
+gpt_cls.py
+
+KEY CHANGE (requested):
+- Each candidate action now carries its own return_method / return_actions (ActionCandidate).
+  Reason: different probes on the same page may require different unwind strategies (e.g.,
+  tab click vs. close vs. back). The global return_method is now only a fallback.
+
+WHAT WE ADD:
+- ActionCandidate wrapper (step + per-candidate return_method/return_actions).
+- NavigationProposal.candidate_actions is List[ActionCandidate].
+- Global return_method/return_actions remain as defaults for legacy prompts.
+
+WORKFLOW CONTRACT:
+- If a candidate supplies return_actions, they run first after that probe.
+- BACK is a last resort for tab-back/custom contexts; per-candidate return overrides global.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Type, TypeVar, Union
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+logging.getLogger("openai").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+
+
+from utils import time_consumed, token_record  # do NOT modify user's utils.py
+
+
+R = TypeVar("R", bound=BaseModel)
+
+
+class ActionType(str, Enum):
+    CLICK = "click"
+    INPUT = "input"
+    WAIT = "wait"
+    BACK = "back"
+    RESTART = "restart"
+    COMPLETE = "complete"
+    NONE = "none"
+
+class OverlayKind(str, Enum):
+    NONE = "none"
+    DISMISS = "dismiss"      # permission/rate/cookie/etc
+    WORKFLOW = "workflow"    # login/search/filter/form/otp
+    LOADING = "loading"      # spinner / transition
+
+
+class UIElementType(str, Enum):
+    BUTTON = "Button"
+    TEXT_BUTTON = "TextButton"
+    ICON_BUTTON = "IconButton"
+    INPUT_TEXT = "InputText"
+    TOGGLE = "Toggle"
+    CHECKBOX = "Checkbox"
+    RADIO = "Radio"
+    TAB = "Tab"
+    LIST_ITEM = "ListItem"
+    TEXT_ONLY = "TextOnly"
+    ICON_ONLY = "IconOnly"
+    DIALOG = "Dialog"
+    OTHER_INTERACTABLE = "OtherInteractable"
+    UNKNOWN = "Unknown"
+
+
+class UIElement(BaseModel):
+    id: int = Field(..., description="Stable id matching UI tree after post-processing")
+    ui_type: UIElementType = Field(..., description="Element category")
+    description: str = Field("", description="Inferred purpose or label (<=15 words)")
+    text: str = Field("", description="Visible text/value if any")
+    clickability: float = Field(0.0, description="0-1 likelihood the element is actionable")
+    location: str = Field("", description="Relative position (e.g., top-left, header, nav bar)")
+
+
+class TagSignal(BaseModel):
+    tag: str = Field(..., description="Short taxonomy tag (snake_case preferred)")
+    weight: float = Field(0.0, ge=0.0, le=1.0, description="0-1 strength of association")
+
+
+class UIView(BaseModel):
+    """
+    A concise, model-generated interpretation of the current screen.
+    Keep it SMALL (the prompt enforces item caps).
+    """
+    description: str = Field("", description="One-paragraph summary of layout and purpose")
+    feedback_message: str = Field("", description="Visible status/toast/error text if any")
+    is_alert_topmost: bool = Field(False, description="True if a blocking dialog/overlay is on top")
+    hint_elements: List[UIElement] = Field(default_factory=list, description="Informative, mostly non-interactive elements")
+    action_elements: List[UIElement] = Field(default_factory=list, description="Interactive elements")
+    match_rate: float = Field(1.0, description="0-1 match confidence between UI tree + screenshot")
+
+    @property
+    def elements(self) -> List[UIElement]:
+        return (self.hint_elements or []) + (self.action_elements or [])
+
+
+class ActionStep(BaseModel):
+    action: ActionType = Field(..., description="Concrete action type")
+    element_id: Optional[int] = Field(None, description="UI element id for click/input")
+    text: Optional[str] = Field(None, description="Text to input when action==input")
+    priority: int = Field(0, description="Higher executes earlier when same group")
+    reasoning: str = Field("", description="Short rationale (<=2 sentences). No chain-of-thought.")
+
+
+class ActionCandidate(BaseModel):
+    """
+    Wraps one probe/forward plan with its own return strategy.
+
+    Rationale:
+      - Some probes need multi-step execution (e.g., input text then tap Confirm).
+      - Different probes on the same page may require different unwind methods
+        (tab click vs. close vs. back). Global return_method/return_actions are only defaults.
+    """
+
+    actions: List[ActionStep] = Field(
+        ...,
+        description="Ordered steps to perform this candidate (e.g., input then click). Must not be empty.",
+        min_items=1,
+    )
+    return_method: Optional[Literal["back", "close", "tab-back", "custom", "none"]] = Field(
+        None,
+        description=(
+            "Preferred return method AFTER this candidate executes. "
+            "If null, the workflow inherits NavigationProposal.return_method."
+        ),
+    )
+    return_actions: List[ActionStep] = Field(
+        default_factory=list,
+        description=(
+            "Custom steps to restore the source state after THIS candidate. "
+            "If empty, workflow falls back to candidate.return_method, then NavigationProposal defaults. (max 4)"
+        ),
+    )
+    score: float = Field(
+        0.0,
+        ge=-1.0,
+        le=1.0,
+        description=(
+            "LLM priority score for this candidate in [-1, 1]. "
+            "Negative to deprioritize (e.g., navigate back), positive to favor."
+        ),
+    )
+
+    tags: List[TagSignal] = Field(
+        default_factory=list,
+        description="Optional candidate-level tags bridging navigation to questionnaire topics (max 6).",
+    )
+
+
+class NavigationProposal(BaseModel):
+    """
+    LLM1 output: UI analysis + overlay resolution + exploration candidates.
+    """
+    state_sig: str = Field(..., description="Echo input state_sig for staleness/debug")
+    ui_view: UIView = Field(..., description="Structured UI analysis (must be present)")
+
+    page_summary: str = Field(..., description="One-line summary of current page")
+    ui_type: str = Field("unknown", description="Page type classification (stable, reusable)")
+    page_tags: List[TagSignal] = Field(default_factory=list, description="Page-level semantic tags (max 10)")
+    tag_evidence: str = Field("", description="Optional short evidence for tags/ui_type (<=1 sentence)")
+    key_interactables: List[int] = Field(default_factory=list, description="IDs worth attention (max 12)")
+
+    overlay_kind: OverlayKind = Field(OverlayKind.NONE, description="Overlay type classification")
+    overlay_reason: str = Field("", description="Why overlay_kind was chosen (<=1 sentence)")
+    overlay_dismiss_actions: List[ActionStep] = Field(
+        default_factory=list,
+        description="Actions to dismiss blocking overlays (max 5); only for overlay_kind=dismiss",
+    )
+    workflow_hints: List[str] = Field(
+        default_factory=list,
+        description="Optional hints when overlay_kind=workflow (e.g., requires input, safe default query)",
+    )
+
+    candidate_actions: List[ActionCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Probe/advance candidates (max 10). Each candidate supplies 1-3 ordered actions "
+            "and may include its own return_method/return_actions; otherwise global defaults apply."
+        ),
+    )
+
+    # IMPORTANT: global return policy fallback (used when a candidate omits its own return_method/return_actions)
+    return_method: Literal["back", "close", "tab-back", "custom", "none"] = Field(
+        "back",
+        description="Default return method after probes when a candidate does not provide its own return_method.",
+    )
+    return_actions: List[ActionStep] = Field(
+        default_factory=list,
+        description=(
+            "Default custom steps to return to the source state after probes when a candidate does not "
+            "provide its own return_actions (max 4)."
+        ),
+    )
+
+    why_these_actions: str = Field("", description="Brief rationale linking actions to active_topics (no hidden CoT)")
+
+
+class RecoveryProposal(BaseModel):
+    """
+    LLM3 output: recover to stable exploration state with custom actions allowed.
+    """
+    state_sig: str = Field(..., description="Echo input state_sig for staleness/debug")
+    ui_view: UIView = Field(..., description="UI interpretation for recovery context")
+
+    page_summary: str = Field(..., description="What screen looks like and why stuck")
+    target_hint: str = Field("", description="Frontier/goal hint")
+    overlay_kind: OverlayKind = Field(OverlayKind.NONE, description="Overlay type classification")
+    overlay_reason: str = Field("", description="Why overlay_kind was chosen")
+    candidate_actions: List[ActionStep] = Field(default_factory=list, description="Up to 5 steps to escape")
+    why: str = Field("", description="Short explanation of recovery strategy (no hidden CoT)")
+
+
+class ProposedUpdate(BaseModel):
+    question_id: str
+    new_answer: Union[str, List[str], None] = None
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    evidence_refs: List[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class QuestionnaireUpdate(BaseModel):
+    detected_signals: List[str] = Field(
+        default_factory=list,
+        description="Evidence strings observed on this screen that may inform answers (conservative, short).",
+    )
+    proposed_updates: List[ProposedUpdate] = Field(
+        default_factory=list,
+        description="Minimal set of questionnaire changes justified by CURRENT SCREEN evidence.",
+    )
+    open_gaps_recommended: List[str] = Field(
+        default_factory=list,
+        description="IDs of gaps that should be prioritized next based on hints from this screen.",
+    )
+    conflicts: List[str] = Field(
+        default_factory=list,
+        description="Detected inconsistencies between current screen evidence and existing answers (string IDs).",
+    )
+
+
+class RelevantTopic(BaseModel):
+    topic_id: str = Field(..., description="Stable topic_id from topic_tree_shallow")
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="0-1 confidence this topic is answerable from this UI")
+    rationale: str = Field("", description="Why this topic matches this screen (<=1 sentence)")
+    expected_evidence: List[str] = Field(default_factory=list, description="What evidence to look for (short bullets)")
+
+
+class TopicRouteResult(BaseModel):
+    """
+    LLM2-1 output: choose which questionnaire topics are relevant on this screen.
+    """
+    state_sig: str = Field(..., description="Echo input state_sig for staleness/debug")
+    relevant_topics: List[RelevantTopic] = Field(default_factory=list, description="Relevant topics with confidence")
+    skip_reason: str = Field("", description="If no relevant topics, why (short)")
+    followups: List[str] = Field(default_factory=list, description="Optional followups like 'open Settings > Privacy'")
+
+
+def _safe_json_from_text(text: str) -> Dict[str, Any]:
+    if not text:
+        raise ValueError("Empty model output")
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError(f"No JSON object found in: {text[:200]!r}")
+    blob = re.sub(r",\s*([}\]])", r"\1", m.group(0))
+    return json.loads(blob)
+
+
+def _b64_image_url(b64: str) -> str:
+    return f"data:image/png;base64,{b64}"
+
+
+def _compact_digest(ui_json: Dict[str, Any], limit: int = 220) -> Dict[str, Any]:
+    """
+    Compact UI for LLM. Keep fields stable and small.
+    NOTE: ids must stay aligned with BaseUI post-processing so NavigationProposal can reference them.
+    """
+    out: List[Dict[str, Any]] = []
+
+    def walk(n: Dict[str, Any], depth: int = 0, parent_id: Optional[int] = None):
+        if len(out) >= limit:
+            return
+        f = n.get("absolute_frame") or n.get("frame") or {}
+        label = n.get("text") or n.get("content_desc") or n.get("semantic_label") or n.get("ocr_text") or n.get("icon_label")
+        out.append(
+            {
+                "id": n.get("id"),
+                "parent_id": parent_id,
+                "depth": depth,
+                "label": (str(label)[:90] if label else None),
+                "text": (str(n.get("text"))[:90] if n.get("text") else None),
+                "content_desc": (str(n.get("content_desc"))[:90] if n.get("content_desc") else None),
+                "resource_id": (str(n.get("resource_id"))[:90] if n.get("resource_id") else None),
+                "semantic_label": (str(n.get("semantic_label"))[:90] if n.get("semantic_label") else None),
+                "semantic_type": (str(n.get("semantic_type"))[:40] if n.get("semantic_type") else None),
+                "ocr_text": (str(n.get("ocr_text"))[:90] if n.get("ocr_text") else None),
+                "icon_label": (str(n.get("icon_label"))[:60] if n.get("icon_label") else None),
+                "clickable": bool(n.get("clickable")),
+                "enabled": bool(n.get("enabled", True)),
+                "bounds": [
+                    int(f.get("x", 0)),
+                    int(f.get("y", 0)),
+                    int(f.get("width", 0)),
+                    int(f.get("height", 0)),
+                ],
+                "class": (str(n.get("class") or "")[:60] or None),
+            }
+        )
+        for ch in (n.get("subviews") or []):
+            walk(ch, depth + 1, n.get("id"))
+
+    for r in (ui_json.get("elements") or []):
+        walk(r, 0, None)
+
+    return {"elements": out, "screenscale": ui_json.get("screenscale", 1.0)}
+
+
+_NAV_SYSTEM = """You are LLM1 for an Android UI exploration agent.
+
+PRIMARY GOAL:
+- Explore the app to gather evidence and COMPLETE a fixed questionnaire efficiently.
+- Use active_topics as the high-level priorities (stable); do not expect full question lists.
+
+INPUTS:
+- state_sig: current UI signature (used to detect stale plans)
+- task: exploration goal string
+- active_topics: list of {topic_id,title,open_gaps,keywords?} (small and stable)
+- ui_digest: structured UI nodes with stable ids (YOU MUST reference these ids)
+- screenshot: actual rendered screen image
+- history: recent executed actions (context only)
+
+REQUIRED OUTPUT (strict JSON matching NavigationProposal):
+1) ui_view (UIView): concise screen interpretation for debugging.
+   - action_elements: up to 12
+   - hint_elements: up to 8
+   - Use ids from ui_digest. If unsure, omit rather than hallucinate.
+
+2) PAGE SEMANTICS (REUSABLE):
+   - ui_type: stable page type label (e.g., settings_list, detail_form, auth_flow, modal_dialog, feed, search, subscription_paywall, permissions_dialog, webview, game_canvas, unknown)
+   - page_tags: 0..10 TagSignal items bridging navigation to questionnaire topics (e.g., privacy, permissions, billing, account, help, legal, navigation_tab, close_control)
+   - tag_evidence: <= 1 sentence
+   - candidate_actions[].tags: 0..6 TagSignal items for each candidate when applicable
+
+3) OVERLAY POLICY (CRITICAL):
+   - Choose overlay_kind from: none | dismiss | workflow | loading
+   - If a dialog/popup/permission/ad/paywall/age gate blocks interaction:
+     set overlay_kind=\"dismiss\" and provide overlay_dismiss_actions first (max 5).
+   - Prefer SAFE dismiss/deny/close/cancel/skip unless task requires acceptance.
+   - When overlay_kind=\"dismiss\", candidate_actions should be empty or minimal.
+   - If the \"overlay\" is actually a workflow surface (login/search/filter/form/otp),
+     set overlay_kind=\"workflow\" and continue to propose candidate_actions normally.
+   - If it's a transient spinner/transition, set overlay_kind=\"loading\".
+
+4) EXPLORATION POLICY:
+   - Provide 2-10 candidate_actions prioritised.
+   - Each candidate should include 1-3 ordered actions (e.g., input then tap Confirm).
+   - Provide a per-candidate \"score\" in [-1, 1] to express priority:
+       * +1 strongly preferred, 0 neutral, -1 strongly deprioritized (e.g., go back).
+   - Each reasoning should mention which active_topics or tags the action may help.
+
+5) PROBE-RETURN POLICY (CRITICAL):
+   - After a probe click, the agent may need to return to the original state to probe the next candidate.
+   - Android BACK is NOT always safe (tabs, nested frames, webviews).
+   - For EACH candidate:
+       * If BACK might exit the page (especially tabs), set that candidate's return_method to \"custom\" or \"tab-back\"
+         AND provide return_actions (1-4 steps) to restore the original state (e.g., click the original tab id).
+   - Global return_method/return_actions are only defaults when a candidate leaves them empty.
+
+6) DO NOT:
+   - invent element_ids not in ui_digest
+   - spam random clicks
+   - leave the app intentionally (external links) unless clearly needed for active_topics
+"""
+
+
+_Q_SYSTEM = """You are LLM2 for questionnaire filling based on CURRENT SCREEN evidence.
+
+PRIMARY GOAL:
+- Update only the MOST relevant questionnaire parts using evidence on this screen.
+- Use hierarchy to infer parent/child relations when confident.
+
+ANTI FLIP-FLOP (CRITICAL):
+- Never set "No" just because evidence isn't visible on this screen.
+- Do NOT flip prior Yes->No or remove multi-selections unless explicit contradiction exists AND confidence >= 0.95.
+
+OUTPUT (strict JSON matching QuestionnaireUpdate):
+- proposed_updates: minimal, evidence-backed changes
+- For single-select questions: new_answer should be ONE option id/value (string), not a list.
+- For multi-select questions: new_answer should be a list of option ids/values.
+- evidence_refs must include ui ids when possible, e.g. {"ui_id": 12, "label": "In-app purchases"}
+"""
+
+
+_TOPIC_ROUTE_SYSTEM = """You are LLM2-1 (Topic Router) for an Android UI exploration agent.
+
+GOAL:
+- Decide which questionnaire TOPICS are relevant/answerable from this screen, cheaply.
+- Do NOT attempt to answer questions here; only route topics.
+
+INPUTS:
+- state_sig: UI signature for staleness/debug
+- topic_tree_shallow: list of topic entries {topic_id,title,keywords?,example_questions?}
+- page_signals: small page cues (ocr_top_lines, ui_type?, local_tags?, page_summary?)
+
+OUTPUT (strict JSON matching TopicRouteResult):
+- relevant_topics: 0..8 topics, each with:
+  - topic_id (must exist in topic_tree_shallow)
+  - confidence 0..1
+  - rationale (<=1 sentence)
+  - expected_evidence (0..4 short strings)
+- If none, set skip_reason (short).
+- followups: optional suggestions to navigate to evidence surfaces (0..4).
+
+RULES:
+- Prefer precision over recall. If unsure, omit.
+- Do not invent topic_ids.
+"""
+
+
+_TOPIC_FILL_SYSTEM = """You are LLM2-2 (Topic Filler) for an Android UI exploration agent.
+
+GOAL:
+- Propose questionnaire updates ONLY for the provided question_pack (topic-scoped).
+- Use ONLY evidence present on the current screen (UI digest + screenshot).
+
+ANTI FLIP-FLOP:
+- Never set "No" just because evidence is not visible.
+- Do not downgrade previous Yes->No or remove multi-select choices unless explicit contradiction is present.
+
+INPUTS:
+- topic_id: current topic being filled
+- question_pack: list of questions (id,type,options,parents,children,current_answer,evidence_summary)
+- current_answers: existing answers for those ids
+- memory: topic-scoped memory (high confidence items)
+- ui_digest + screenshot: authoritative current UI
+
+OUTPUT (strict JSON matching QuestionnaireUpdate):
+- proposed_updates: only include items you can justify from this screen.
+- For single-select questions: new_answer should be ONE option id/value (string).
+- For multi-select questions: new_answer should be a list of option ids/values.
+"""
+
+
+_RECOVERY_SYSTEM = """You are LLM3 for recovery in Android UI automation.
+
+PRIMARY GOAL:
+- Resolve popups/dialogs/ads/permission prompts
+- Escape stuck states (no UI change, wrong page, return failed)
+- Restore a stable exploration state
+
+OUTPUT (strict JSON matching RecoveryProposal):
+- ui_view required (concise)
+- candidate_actions <= 5
+- Allowed actions: click, input, back, wait, restart, none, complete
+- Choose overlay_kind from: none | dismiss | workflow | loading
+
+STRATEGY:
+1) If overlay likely, propose click actions on Close/X/Cancel/Deny/Not now/OK (safe first).
+2) If return failed, propose actions to return to stable state (close dialog, back, or click top-left back icon).
+3) If truly stuck, propose restart as last resort.
+"""
+
+
+class GPTClient:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o",
+        temperature: float = 0.2,
+        timeout_s: int = 60,
+    ):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+        self.model = model
+        self.temperature = float(temperature)
+        self.timeout_s = int(timeout_s)
+
+        self.client = None
+        try:
+            import openai  # type: ignore
+
+            if hasattr(openai, "OpenAI"):
+                self.client = openai.OpenAI(api_key=self.api_key)
+            elif hasattr(openai, "Client"):
+                self.client = openai.Client(api_key=self.api_key) if self.api_key else openai.Client()
+            else:
+                self.client = openai
+        except Exception:
+            self.client = None
+
+    @time_consumed
+    def propose_navigation(
+        self,
+        screenshot_b64: str,
+        ui_json: Dict[str, Any],
+        active_topics: List[Dict[str, Any]],
+        task: str,
+        history: Optional[List[str]] = None,
+        state_sig: str = "",
+    ) -> NavigationProposal:
+        ui_digest = _compact_digest(ui_json, limit=240)
+        payload = {
+            "state_sig": state_sig,
+            "task": task,
+            "active_topics": active_topics[:8],
+            "history": (history or [])[-12:],
+            "ui_digest": ui_digest,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _NAV_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, NavigationProposal, opname="propose_navigation")
+        out.overlay_dismiss_actions = list(out.overlay_dismiss_actions or [])[:5]
+        out.candidate_actions = list(out.candidate_actions or [])[:10]
+        for c in out.candidate_actions:
+            c.actions = list(c.actions or [])[:3]
+            c.return_actions = list(c.return_actions or [])[:4]
+            c.tags = list(c.tags or [])[:6]
+        out.key_interactables = list(out.key_interactables or [])[:12]
+        out.return_actions = list(out.return_actions or [])[:4]
+        out.page_tags = list(out.page_tags or [])[:10]
+        out.state_sig = state_sig or out.state_sig
+        return out
+
+    @time_consumed
+    def propose_questionnaire_updates(
+        self,
+        screenshot_b64: str,
+        ui_json: Dict[str, Any],
+        open_gaps: List[str],
+        hierarchy: Any,
+        memory: Optional[List[Dict[str, Any]]] = None,
+        current_answers: Optional[Dict[str, Any]] = None,
+    ) -> QuestionnaireUpdate:
+        ui_digest = _compact_digest(ui_json, limit=260)
+        payload = {
+            "open_gaps": open_gaps[:120],
+            "hierarchy": hierarchy,
+            "memory": memory or [],
+            "current_answers": current_answers or {},
+            "ui_digest": ui_digest,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _Q_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, QuestionnaireUpdate, opname="propose_questionnaire_updates")
+        out.proposed_updates = list(out.proposed_updates or [])[:24]
+        return out
+
+    @time_consumed
+    def propose_topic_routes(
+        self,
+        topic_tree_shallow: List[Dict[str, Any]],
+        page_signals: Dict[str, Any],
+        state_sig: str = "",
+    ) -> TopicRouteResult:
+        payload = {
+            "state_sig": state_sig,
+            "topic_tree_shallow": topic_tree_shallow[:80],
+            "page_signals": page_signals,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _TOPIC_ROUTE_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+        out = self._call_structured(messages, TopicRouteResult, opname="propose_topic_routes")
+        out.relevant_topics = list(out.relevant_topics or [])[:8]
+        for t in out.relevant_topics:
+            t.expected_evidence = list(t.expected_evidence or [])[:4]
+        out.followups = list(out.followups or [])[:4]
+        out.state_sig = state_sig or out.state_sig
+        return out
+
+    @time_consumed
+    def propose_topic_fill(
+        self,
+        screenshot_b64: str,
+        ui_json: Dict[str, Any],
+        topic_id: str,
+        question_pack: List[Dict[str, Any]],
+        memory: Optional[List[Dict[str, Any]]] = None,
+        current_answers: Optional[Dict[str, Any]] = None,
+        page_signals: Optional[Dict[str, Any]] = None,
+        state_sig: str = "",
+    ) -> QuestionnaireUpdate:
+        ui_digest = _compact_digest(ui_json, limit=280)
+        payload = {
+            "state_sig": state_sig,
+            "topic_id": topic_id,
+            "page_signals": page_signals or {},
+            "question_pack": question_pack[:28],
+            "current_answers": current_answers or {},
+            "memory": memory or [],
+            "ui_digest": ui_digest,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _TOPIC_FILL_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, QuestionnaireUpdate, opname="propose_topic_fill")
+        out.proposed_updates = list(out.proposed_updates or [])[:24]
+        return out
+
+    @time_consumed
+    def recover_state(
+        self,
+        screenshot_b64: str,
+        ui_json: Dict[str, Any],
+        frontier_hint: str = "",
+        last_nav: Optional[NavigationProposal] = None,
+        note: str = "",
+        state_sig: str = "",
+    ) -> RecoveryProposal:
+        ui_digest = _compact_digest(ui_json, limit=240)
+        payload = {
+            "state_sig": state_sig,
+            "frontier_hint": frontier_hint,
+            "note": note,
+            "last_nav": last_nav.model_dump() if last_nav else None,
+            "ui_digest": ui_digest,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _RECOVERY_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, RecoveryProposal, opname="recover_state")
+        out.candidate_actions = list(out.candidate_actions or [])[:5]
+        out.state_sig = state_sig or out.state_sig
+        return out
+
+    def _call_structured(self, messages: List[Dict[str, Any]], model_cls: Type[R], opname: str) -> R:
+        """
+        IPO:
+          in : messages (system+user), model_cls (Pydantic), opname
+          out: parsed Pydantic instance
+        WHEN called:
+          - internal helper for each LLM call
+        FALLBACKS:
+          - prefer beta.chat.completions.parse when available
+          - otherwise use chat.completions.create and JSON-extract
+        """
+        if self.client is None:
+            raise RuntimeError(f"OpenAI client not available for {opname}")
+
+        # Preferred: structured parse
+        try:
+            resp = self.client.beta.chat.completions.parse(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                timeout=self.timeout_s,
+                response_format=model_cls,
+            )
+            try:
+                token_record(opname, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+                logger.info("%s tokens: prompt=%s completion=%s", opname, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+            except Exception:
+                pass
+            return resp.choices[0].message.parsed
+        except Exception:
+            logger.error("Structured parse failed for %s; falling back to JSON extraction.", opname, exc_info=True)
+
+        # Fallback: normal completion (best-effort across OpenAI client versions)
+        try:
+            if hasattr(self.client, "chat") and hasattr(self.client.chat, "completions"):
+                resp2 = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    timeout=self.timeout_s,
+                )
+                try:
+                    token_record(opname, resp2.usage.prompt_tokens, resp2.usage.completion_tokens)
+                except Exception:
+                    pass
+                text = resp2.choices[0].message.content or ""
+            elif hasattr(self.client, "ChatCompletion"):
+                # legacy module-style client
+                resp2 = self.client.ChatCompletion.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    timeout=self.timeout_s,
+                )
+                try:
+                    usage = resp2.get("usage") or {}
+                    token_record(opname, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)))
+                except Exception:
+                    pass
+                text = ((resp2.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            else:
+                raise RuntimeError("No supported chat completion method on client")
+
+            data = _safe_json_from_text(text)
+            if hasattr(model_cls, "model_validate"):
+                return model_cls.model_validate(data)  # type: ignore[return-value]
+            return model_cls.parse_obj(data)  # type: ignore[return-value]
+        except Exception as exc:
+            raise RuntimeError(f"LLM call failed for {opname}: {exc}") from exc
+
+
+
+__all__ = [
+    "GPTClient",
+    "UIView",
+    "UIElement",
+    "UIElementType",
+    "ActionStep",
+    "ActionCandidate",
+    "ActionType",
+    "OverlayKind",
+    "NavigationProposal",
+    "RecoveryProposal",
+    "QuestionnaireUpdate",
+    "TopicRouteResult",
+    "RelevantTopic",
+    "ProposedUpdate",
+]

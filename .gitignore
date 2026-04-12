@@ -1,0 +1,8 @@
+.env
+.venv
+node_modules
+*.zip
+*.rar
+__pycache__
+traces
+*.pyc

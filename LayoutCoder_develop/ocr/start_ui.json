@@ -1,0 +1,49 @@
+{
+    "img_shape": [
+        1792,
+        828,
+        3
+    ],
+    "texts": [
+        {
+            "id": 0,
+            "content": "ONE \u5ddd LonK",
+            "column_min": 252,
+            "row_min": 147,
+            "column_max": 601,
+            "row_max": 418,
+            "width": 349,
+            "height": 271
+        },
+        {
+            "id": 4,
+            "content": "\u65e9\u9910\u5236\u4f5c\u79d8\u7c4d",
+            "column_min": 295,
+            "row_min": 1710,
+            "column_max": 538,
+            "row_max": 1754,
+            "width": 243,
+            "height": 44
+        },
+        {
+            "id": 5,
+            "content": "\u67e5\u770b\u6d0b\u60c5",
+            "column_min": 610,
+            "row_min": 1744,
+            "column_max": 679,
+            "row_max": 1762,
+            "width": 69,
+            "height": 18
+        },
+        {
+            "id": 6,
+            "content": "\u5f00\u542f\u4e00\u5929\u597d\u5fc3\u60c5",
+            "column_min": 371,
+            "row_min": 1755,
+            "column_max": 510,
+            "row_max": 1786,
+            "width": 139,
+            "height": 31
+        }
+    ]
+}
