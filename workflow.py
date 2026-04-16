@@ -878,7 +878,7 @@ class WorkflowRunner:
 
         # Entry is an observation (no predecessor edge).
         # 把入口状态记为一次“观察到的页面”，因为它没有前驱动作，不适合记成边。
-        self._graph_record_observation(cur_sig, meta={"entry": True})
+        self._graph_record_observation(cur_sig, meta={"entry": True}, snap=snap)
         # 为入口状态安排异步分析：包括导航建议和问卷相关的 LLM 任务。
         self._schedule_state(cur_sig, snap, task)
         # 把进入入口页记为一次进展，便于重置 no_progress 之类的计数器。
@@ -1897,38 +1897,52 @@ class WorkflowRunner:
             coarse_sig = compute_coarse_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             struct_sig = compute_structural_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             fine_sig = compute_fine_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
+            identity = self._resolve_state_identity(
+                xml_reliable=xml_reliable,
+                xml_state_sig=sig,
+                struct_sig=struct_sig,
+                screenshot_phash=screenshot_phash,
+                foreground_package=foreground_package,
+                foreground_activity=foreground_activity,
+            )
+            sig = str(identity.get("state_sig") or sig or "")
             try:
                 if sig and struct_sig:
                     self.sig_to_family[sig] = struct_sig
             except Exception:
                 pass
             snap = {
-                "xml": xml,
-                "xml_raw": xml_raw,
-                "screenshot": screenshot_b64,
-                "screenshot_raw": screenshot_b64_raw,
-                "uist": uist2,
-                "vid_map": vid_map,
-                "state_sig": sig,
-                "device_info": info,
+                "xml": xml,  # 处理后的 XML：后续解析/UI 判断真正使用的层级树
+                "xml_raw": xml_raw,  # 原始 XML：保留给调试对照
+                "screenshot": screenshot_b64,  # 处理后的截图：后续 OCR/UIED/相似度使用
+                "screenshot_raw": screenshot_b64_raw,  # 原始截图：保留给调试对照
+                "uist": uist2,  # 后处理后的 UI 树：签名、LLM、动作定位都基于它
+                "vid_map": vid_map,  # element_id -> 节点映射：动作执行时靠它找元素
+                "state_sig": sig,  # 当前页面主签名：状态图/cache 的核心 key
+                "xml_reliable": xml_reliable,  # 顶层冗余一份 XML 可信标记，方便调试和状态判断
+                "device_info": info,  # 设备信息：分辨率、像素比等
                 "meta": {
-                    "raw_key": raw_key,
-                    "cache_hit": bool(cached),
-                    "cache_size": len(self.snapshot_cache),
-                    "xml_hash": xml_hash,
-                    "screenshot_hash": screenshot_hash,
-                    "screenshot_phash": screenshot_phash,
-                    "xml_hash_raw": xml_hash_raw,
-                    "screenshot_hash_raw": screenshot_hash_raw,
-                    "xml_reliable": xml_reliable,
-                    "coord_scale": coord_scale,
-                    "coarse_sig": coarse_sig,
-                    "struct_sig": struct_sig,
-                    "fine_sig": fine_sig,
-                    "foreground_package": foreground_package,
-                    "foreground_activity": foreground_activity,
-                    **(crop_meta or {}),
-                    **scale_meta,
+                    "raw_key": raw_key,  # 这次快照在 snapshot cache 里的 key
+                    "cache_hit": bool(cached),  # 是否命中了 snapshot cache
+                    "cache_size": len(self.snapshot_cache),  # 当前 snapshot cache 大小
+                    "xml_hash": xml_hash,  # 处理后 XML 的 hash
+                    "screenshot_hash": screenshot_hash,  # 处理后截图的 hash
+                    "screenshot_phash": screenshot_phash,  # 处理后截图的感知 hash（视觉相似度）
+                    "xml_hash_raw": xml_hash_raw,  # 原始 XML 的 hash
+                    "screenshot_hash_raw": screenshot_hash_raw,  # 原始截图的 hash
+                    "xml_reliable": xml_reliable,  # XML 是否足够可靠，可用于状态判断
+                    "coord_scale": coord_scale,  # XML 坐标到截图坐标的缩放比例
+                    "coarse_sig": coarse_sig,  # 粗粒度签名：宽松比较页面
+                    "struct_sig": struct_sig,  # 结构签名：probe-return 回页时常用
+                    "fine_sig": fine_sig,  # 细粒度签名：更严格地区分页面
+                    "identity_source": str(identity.get("identity_source") or ""),  # 当前 state_sig 来自 xml 还是 phash
+                    "identity_hash": str(identity.get("identity_hash") or ""),  # 本次状态身份判定依赖的核心 hash
+                    "matched_existing": bool(identity.get("matched_existing")),  # phash 模式下是否复用了历史视觉状态
+                    "matched_similarity": float(identity.get("matched_similarity") or 0.0),  # 命中历史视觉状态时的相似度
+                    "foreground_package": foreground_package,  # 当前前台包名
+                    "foreground_activity": foreground_activity,  # 当前前台 activity
+                    **(crop_meta or {}),  # 裁切相关元信息：状态栏裁掉了多少等
+                    **scale_meta,  # 尺寸/缩放相关元信息：png/xml 尺寸等
                 },
             }
             # Keep hashes attached to graph nodes for debugging/disambiguation without inflating visits.
@@ -1938,11 +1952,16 @@ class WorkflowRunner:
                     "coarse_sig": coarse_sig,
                     "struct_sig": struct_sig,
                     "fine_sig": fine_sig,
+                    "xml_reliable": xml_reliable,
                     "xml_hash": xml_hash,
                     "screenshot_hash": screenshot_hash,
                     "screenshot_phash": screenshot_phash,
                     "xml_hash_raw": xml_hash_raw,
                     "screenshot_hash_raw": screenshot_hash_raw,
+                    "identity_source": str(identity.get("identity_source") or ""),
+                    "identity_hash": str(identity.get("identity_hash") or ""),
+                    "matched_existing": bool(identity.get("matched_existing")),
+                    "matched_similarity": float(identity.get("matched_similarity") or 0.0),
                     "coord_scale": coord_scale,
                     "foreground_package": foreground_package,
                     "foreground_activity": foreground_activity,
@@ -2078,41 +2097,57 @@ class WorkflowRunner:
                     self.snapshot_cache.popitem(last=False)
                 self._log_event("snapshot_cache_miss", sig=sig, raw_key=raw_key, cache_size=len(self.snapshot_cache))
 
+            screenshot_phash = compute_screenshot_phash(screenshot_b64)
             xml_reliable = bool(xml and ("<node" in xml or "<hierarchy" in xml) and len(xml) >= 400)
             coarse_sig = compute_coarse_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             struct_sig = compute_structural_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             fine_sig = compute_fine_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
+            identity = self._resolve_state_identity(
+                xml_reliable=xml_reliable,
+                xml_state_sig=sig,
+                struct_sig=struct_sig,
+                screenshot_phash=screenshot_phash,
+                foreground_package=foreground_package,
+                foreground_activity=foreground_activity,
+            )
+            sig = str(identity.get("state_sig") or sig or "")
             try:
                 if sig and struct_sig:
                     self.sig_to_family[sig] = struct_sig
             except Exception:
                 pass
             snap = {
-                "xml": xml,
-                "xml_raw": xml_raw,
-                "screenshot": screenshot_b64,
-                "screenshot_raw": screenshot_b64_raw,
-                "uist": uist2,
-                "vid_map": vid_map,
-                "state_sig": sig,
-                "device_info": info,
+                "xml": xml,  # 处理后的 XML：后续解析/UI 判断真正使用的层级树
+                "xml_raw": xml_raw,  # 原始 XML：保留给调试对照
+                "screenshot": screenshot_b64,  # 处理后的截图：后续 OCR/相似度使用
+                "screenshot_raw": screenshot_b64_raw,  # 原始截图：保留给调试对照
+                "uist": uist2,  # 后处理后的 UI 树：签名、LLM、动作定位都基于它
+                "vid_map": vid_map,  # element_id -> 节点映射：动作执行时靠它找元素
+                "state_sig": sig,  # 当前页面主签名：状态图/cache 的核心 key
+                "xml_reliable": xml_reliable,  # 顶层冗余一份 XML 可信标记，方便调试和状态判断
+                "device_info": info,  # 设备信息：分辨率、像素比等
                 "meta": {
-                    "raw_key": raw_key,
-                    "cache_hit": bool(cached),
-                    "cache_size": len(self.snapshot_cache),
-                    "xml_hash": xml_hash,
-                    "screenshot_hash": screenshot_hash,
-                    "xml_hash_raw": xml_hash_raw,
-                    "screenshot_hash_raw": screenshot_hash_raw,
-                    "xml_reliable": xml_reliable,
-                    "coord_scale": coord_scale,
-                    "coarse_sig": coarse_sig,
-                    "struct_sig": struct_sig,
-                    "fine_sig": fine_sig,
-                    "foreground_package": foreground_package,
-                    "foreground_activity": foreground_activity,
-                    **(crop_meta or {}),
-                    **scale_meta,
+                    "raw_key": raw_key,  # 这次快照在 snapshot cache 里的 key
+                    "cache_hit": bool(cached),  # 是否命中了 snapshot cache
+                    "cache_size": len(self.snapshot_cache),  # 当前 snapshot cache 大小
+                    "xml_hash": xml_hash,  # 处理后 XML 的 hash
+                    "screenshot_hash": screenshot_hash,  # 处理后截图的 hash
+                    "xml_hash_raw": xml_hash_raw,  # 原始 XML 的 hash
+                    "screenshot_hash_raw": screenshot_hash_raw,  # 原始截图的 hash
+                    "screenshot_phash": screenshot_phash,  # 处理后截图的感知 hash（视觉相似度）
+                    "xml_reliable": xml_reliable,  # XML 是否足够可靠，可用于状态判断
+                    "coord_scale": coord_scale,  # XML 坐标到截图坐标的缩放比例
+                    "coarse_sig": coarse_sig,  # 粗粒度签名：宽松比较页面
+                    "struct_sig": struct_sig,  # 结构签名：probe-return 回页时常用
+                    "fine_sig": fine_sig,  # 细粒度签名：更严格地区分页面
+                    "identity_source": str(identity.get("identity_source") or ""),  # 当前 state_sig 来自 xml 还是 phash
+                    "identity_hash": str(identity.get("identity_hash") or ""),  # 本次状态身份判定依赖的核心 hash
+                    "matched_existing": bool(identity.get("matched_existing")),  # phash 模式下是否复用了历史视觉状态
+                    "matched_similarity": float(identity.get("matched_similarity") or 0.0),  # 命中历史视觉状态时的相似度
+                    "foreground_package": foreground_package,  # 当前前台包名
+                    "foreground_activity": foreground_activity,  # 当前前台 activity
+                    **(crop_meta or {}),  # 裁切相关元信息：状态栏裁掉了多少等
+                    **scale_meta,  # 尺寸/缩放相关元信息：png/xml 尺寸等
                 },
             }
             # Keep hashes attached to graph nodes for debugging/disambiguation without inflating visits.
@@ -2122,10 +2157,16 @@ class WorkflowRunner:
                     "coarse_sig": coarse_sig,
                     "struct_sig": struct_sig,
                     "fine_sig": fine_sig,
+                    "xml_reliable": xml_reliable,
                     "xml_hash": xml_hash,
                     "screenshot_hash": screenshot_hash,
+                    "screenshot_phash": screenshot_phash,
                     "xml_hash_raw": xml_hash_raw,
                     "screenshot_hash_raw": screenshot_hash_raw,
+                    "identity_source": str(identity.get("identity_source") or ""),
+                    "identity_hash": str(identity.get("identity_hash") or ""),
+                    "matched_existing": bool(identity.get("matched_existing")),
+                    "matched_similarity": float(identity.get("matched_similarity") or 0.0),
                     "coord_scale": coord_scale,
                     "foreground_package": foreground_package,
                     "foreground_activity": foreground_activity,
@@ -2350,7 +2391,30 @@ class WorkflowRunner:
     # Graph recording (delegates semantics to StateGraph)
     # ---------------------------
 
-    def _graph_record_observation(self, sig: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    def _graph_state_meta(self, snap: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if snap:
+            meta = snap.get("meta") or {}
+            payload.update(
+                {
+                    "xml_reliable": bool(snap.get("xml_reliable", meta.get("xml_reliable", False))),
+                    "screenshot_phash": str(meta.get("screenshot_phash") or ""),
+                    "identity_source": str(meta.get("identity_source") or ""),
+                    "identity_hash": str(meta.get("identity_hash") or ""),
+                    "matched_existing": bool(meta.get("matched_existing")),
+                    "matched_similarity": float(meta.get("matched_similarity") or 0.0),
+                    "struct_sig": str(meta.get("struct_sig") or ""),
+                    "coarse_sig": str(meta.get("coarse_sig") or ""),
+                    "fine_sig": str(meta.get("fine_sig") or ""),
+                    "foreground_package": str(meta.get("foreground_package") or ""),
+                    "foreground_activity": str(meta.get("foreground_activity") or ""),
+                }
+            )
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _graph_record_observation(self, sig: str, meta: Optional[Dict[str, Any]] = None, snap: Optional[Dict[str, Any]] = None) -> None:
         """
         IPO:
           in : sig observed without a meaningful predecessor edge
@@ -2363,14 +2427,15 @@ class WorkflowRunner:
         WHICH state:
           - sig is the authoritative current snapshot sig
         """
+        graph_meta = self._graph_state_meta(snap, meta)
         was_new = not self.graph.has_state(sig)
         try:
-            self.graph.record_observation(sig, meta=meta)
+            self.graph.record_observation(sig, meta=graph_meta)
         except Exception:
             # fallback to touch
-            self.graph.touch(sig, meta=meta)
+            self.graph.touch(sig, meta=graph_meta)
         self._record_state_trace(sig)
-        self._emit_transition(sig, {"kind": "observation", "sig": sig, "meta": meta or {}})
+        self._emit_transition(sig, {"kind": "observation", "sig": sig, "meta": graph_meta})
         if was_new:
             self._mark_progress("new_state_discovered", {"sig": sig})
 
@@ -2569,7 +2634,16 @@ class WorkflowRunner:
             self.recent_transitions = self.recent_transitions[-18:]
         self._maybe_detect_loop()
 
-        dst_was_new = self.graph.record_transition(src, dst, payload, touch=bool(touch))
+        src_graph_meta = self._graph_state_meta(src_snap)
+        dst_graph_meta = self._graph_state_meta(dst_snap)
+        dst_was_new = self.graph.record_transition(
+            src,
+            dst,
+            payload,
+            touch=bool(touch),
+            src_meta=src_graph_meta,
+            dst_meta=dst_graph_meta,
+        )
         self._record_state_trace(dst)
         self._emit_transition(
             dst,
@@ -2686,7 +2760,7 @@ class WorkflowRunner:
           - Keeps DFS completion/backtrace meaningful even after discontinuities.
         """
         if record_observation:
-            self._graph_record_observation(cur_sig)
+            self._graph_record_observation(cur_sig, snap=snap)
             self._mark_progress("state_changed", {"sig": cur_sig})
         else:
             # If a caller believes the move had a recorded edge but a recapture produced a new sig,
@@ -2694,7 +2768,7 @@ class WorkflowRunner:
             last = self.recent_states[-1] if self.recent_states else ""
             if last and last != cur_sig:
                 self._log_event("implicit_observation", sig=cur_sig, prev_sig=last)
-                self._graph_record_observation(cur_sig, meta={"implicit": True, "prev_sig": last})
+                self._graph_record_observation(cur_sig, meta={"implicit": True, "prev_sig": last}, snap=snap)
         if cur_sig in self.dfs_stack:
             # external move: pop without marking explored
             self._pop_stack_to(cur_sig, mark_explored=False)
@@ -4670,7 +4744,7 @@ class WorkflowRunner:
             if not snap2:
                 continue
             cur_sig = str(snap2.get("state_sig") or "")
-            self._graph_record_observation(cur_sig)
+            self._graph_record_observation(cur_sig, snap=snap2)
             self._mark_progress("state_changed", {"sig": cur_sig, "via": "backtrace"})
             # Intentional backtrace: pop stack and mark explored for popped branches
             self._pop_stack_to(cur_sig, mark_explored=True)
@@ -5415,7 +5489,7 @@ class WorkflowRunner:
 
         cur = snap["state_sig"]
         self.restart_entry_sig = cur
-        self._graph_record_observation(cur, meta={"post_restart": True})
+        self._graph_record_observation(cur, meta={"post_restart": True}, snap=snap)
 
         if not best_target:
             self._schedule_state(cur, snap, task)

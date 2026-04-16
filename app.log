@@ -1,0 +1,205 @@
+[2026-04-12 16:00:17,300] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:00:19,345] WARNING [urllib3.connectionpool:868] Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。")': /session
+[2026-04-12 16:00:21,390] WARNING [urllib3.connectionpool:868] Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。")': /session
+[2026-04-12 16:00:23,442] WARNING [urllib3.connectionpool:868] Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。")': /session
+[2026-04-12 16:00:25,491] ERROR [appium_android:146] Failed to create Appium driver
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connection.py", line 204, in _new_conn
+    sock = connection.create_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\util\connection.py", line 85, in create_connection
+    raise err
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\util\connection.py", line 73, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 493, in _make_request
+    conn.request(
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connection.py", line 500, in request
+    self.endheaders()
+  File "C:\Users\ruogan\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1314, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "C:\Users\ruogan\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1074, in _send_output
+    self.send(msg)
+  File "C:\Users\ruogan\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1018, in send
+    self.connect()
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connection.py", line 331, in connect
+    self.sock = self._new_conn()
+                ^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connection.py", line 219, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\appium_android.py", line 143, in init_connection
+    self.driver = WebDriver(command_executor=self.server_url, options=options)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\appium\webdriver\webdriver.py", line 251, in __init__
+    super().__init__(
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 271, in __init__
+    self.start_session(capabilities)
+  File "F:\workplace\framework\.venv\Lib\site-packages\appium\webdriver\webdriver.py", line 344, in start_session
+    response = self.execute(RemoteCommand.NEW_SESSION, w3c_caps)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 443, in execute
+    response = cast(RemoteConnection, self.command_executor).execute(driver_command, params)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\remote_connection.py", line 407, in execute
+    return self._request(command_info[0], url, body=data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\remote_connection.py", line 431, in _request
+    response = self._conn.request(method, url, body=body, headers=headers, timeout=self._client_config.timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\_request_methods.py", line 143, in request
+    return self.request_encode_body(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\_request_methods.py", line 278, in request_encode_body
+    return self.urlopen(method, url, **extra_kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\poolmanager.py", line 457, in urlopen
+    response = conn.urlopen(method, u.request_uri, **kw)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 871, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 871, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 871, in urlopen
+    return self.urlopen(
+           ^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\urllib3\util\retry.py", line 535, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPConnectionPool(host='127.0.0.1', port=4723): Max retries exceeded with url: /session (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。"))
+[2026-04-12 16:02:17,445] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:02:36,261] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:02:38,447] INFO [appium_android:144] Appium driver created
+[2026-04-12 16:02:39,651] INFO [appium_android:208] Force-stop com.marktka.calculatorYou via adb
+[2026-04-12 16:02:40,424] DEBUG [appium_android:276] Capturing snapshot (xml + screenshot + device_info)
+[2026-04-12 16:02:41,497] DEBUG [appium_android:224] Page stable with hash=070e87b6fcfd10f8163efb8232c551f1
+[2026-04-12 16:02:41,882] DEBUG [ui_cls:1540] UIED-first post-process start: 1 root nodes; 56 nodes
+[2026-04-12 16:02:41,884] DEBUG [ui_cls:414] UIED start: key=40917f51f55e49acd739ef0b2e8c1490 output_root=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490 image=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490\40917f51f55e49acd739ef0b2e8c1490.png
+[2026-04-12 16:03:27,923] ERROR [gpt_cls:705] Structured parse failed for propose_topic_routes; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 691, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-********************************************************************************************************************************************************lUAA. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'code': 'invalid_api_key', 'param': None}, 'status': 401}
+[2026-04-12 16:03:28,615] ERROR [gpt_cls:705] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 691, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-********************************************************************************************************************************************************lUAA. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'code': 'invalid_api_key', 'param': None}, 'status': 401}
+[2026-04-12 16:06:14,314] WARNING [workflow:3139] NAV timeout sig=767ea300 cancelled=False -> heuristics allowed.
+[2026-04-12 16:06:26,949] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:06:29,130] INFO [appium_android:144] Appium driver created
+[2026-04-12 16:06:30,241] INFO [appium_android:208] Force-stop com.marktka.calculatorYou via adb
+[2026-04-12 16:06:30,968] DEBUG [appium_android:276] Capturing snapshot (xml + screenshot + device_info)
+[2026-04-12 16:06:32,015] DEBUG [appium_android:224] Page stable with hash=78b7d0ca7bff904ac152d8b55b85f426
+[2026-04-12 16:06:32,361] DEBUG [ui_cls:1540] UIED-first post-process start: 1 root nodes; 56 nodes
+[2026-04-12 16:06:32,365] DEBUG [ui_cls:414] UIED start: key=40917f51f55e49acd739ef0b2e8c1490 output_root=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490 image=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490\40917f51f55e49acd739ef0b2e8c1490.png
+[2026-04-12 16:06:59,755] ERROR [gpt_cls:705] Structured parse failed for propose_topic_routes; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 691, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-********************************************************************************************************************************************************lUAA. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'code': 'invalid_api_key', 'param': None}, 'status': 401}
+[2026-04-12 16:07:00,390] ERROR [gpt_cls:705] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 691, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-********************************************************************************************************************************************************lUAA. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'code': 'invalid_api_key', 'param': None}, 'status': 401}
+[2026-04-12 16:09:01,803] WARNING [workflow:3139] NAV timeout sig=767ea300 cancelled=False -> heuristics allowed.
+[2026-04-12 16:11:24,492] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:11:26,733] INFO [appium_android:144] Appium driver created
+[2026-04-12 16:11:27,701] INFO [appium_android:208] Force-stop com.marktka.calculatorYou via adb
+[2026-04-12 16:11:28,442] DEBUG [appium_android:276] Capturing snapshot (xml + screenshot + device_info)
+[2026-04-12 16:11:29,475] DEBUG [appium_android:224] Page stable with hash=abecdbb6bd56f9a2d841b0741c1ea2e8
+[2026-04-12 16:11:29,827] DEBUG [ui_cls:1540] UIED-first post-process start: 1 root nodes; 56 nodes
+[2026-04-12 16:11:29,829] DEBUG [ui_cls:414] UIED start: key=40917f51f55e49acd739ef0b2e8c1490 output_root=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490 image=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490\40917f51f55e49acd739ef0b2e8c1490.png
+[2026-04-12 16:16:13,009] WARNING [workflow:3465] Return failed after probe (src_sig=afa8d0e8, dst_sig=eb0bbc95) -> recovery.
+[2026-04-12 16:43:04,706] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:43:05,004] ERROR [appium_android:146] Failed to create Appium driver
+Traceback (most recent call last):
+  File "F:\workplace\framework\appium_android.py", line 143, in init_connection
+    self.driver = WebDriver(command_executor=self.server_url, options=options)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\appium\webdriver\webdriver.py", line 251, in __init__
+    super().__init__(
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 271, in __init__
+    self.start_session(capabilities)
+  File "F:\workplace\framework\.venv\Lib\site-packages\appium\webdriver\webdriver.py", line 344, in start_session
+    response = self.execute(RemoteCommand.NEW_SESSION, w3c_caps)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 446, in execute
+    self.error_handler.check_response(response)
+  File "F:\workplace\framework\.venv\Lib\site-packages\selenium\webdriver\remote\errorhandler.py", line 232, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.WebDriverException: Message: Error getting device API level. Original error: Error executing adbExec. Original error: 'Command ''E:\Android\android-sdk\platform-tools\adb.exe' -P 5037 -s emulator-5554 shell getprop ro.build.version.sdk' exited with code 1'; Command output: error: device offline
+
+Stacktrace:
+UnknownError: Error getting device API level. Original error: Error executing adbExec. Original error: 'Command ''E:\Android\android-sdk\platform-tools\adb.exe' -P 5037 -s emulator-5554 shell getprop ro.build.version.sdk' exited with code 1'; Command output: error: device offline
+
+    at getResponseForW3CError (F:\workplace\framework\node_modules\@appium\base-driver\lib\protocol\errors.ts:1103:34)
+    at asyncHandler (F:\workplace\framework\node_modules\@appium\base-driver\lib\protocol\protocol.ts:536:57)
+The above error is caused by
+Error: Error getting device API level. Original error: Error executing adbExec. Original error: 'Command ''E:\Android\android-sdk\platform-tools\adb.exe' -P 5037 -s emulator-5554 shell getprop ro.build.version.sdk' exited with code 1'; Command output: error: device offline
+
+    at ADB.getApiLevel (F:\workplace\AnBot\node_modules\appium-uiautomator2-driver\node_modules\appium-adb\lib\tools\general-commands.ts:90:13)
+    at AndroidUiautomator2Driver.deleteSession (F:\workplace\AnBot\node_modules\appium-uiautomator2-driver\lib\driver.ts:928:12)
+    at AndroidUiautomator2Driver.createSession (F:\workplace\AnBot\node_modules\appium-uiautomator2-driver\lib\driver.ts:416:7)
+    at AppiumDriver.createSession (F:\workplace\framework\node_modules\appium\lib\appium.js:360:35)
+[2026-04-12 16:43:12,117] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-12 16:43:23,645] INFO [appium_android:144] Appium driver created
+[2026-04-12 16:43:24,680] INFO [appium_android:208] Force-stop com.marktka.calculatorYou via adb
+[2026-04-12 16:43:25,411] DEBUG [appium_android:276] Capturing snapshot (xml + screenshot + device_info)
+[2026-04-12 16:43:26,419] DEBUG [appium_android:224] Page stable with hash=7128822f38d4defbcead8b917f82bede
+[2026-04-12 16:43:26,753] DEBUG [ui_cls:1540] UIED-first post-process start: 1 root nodes; 56 nodes
+[2026-04-12 16:43:26,756] DEBUG [ui_cls:414] UIED start: key=40917f51f55e49acd739ef0b2e8c1490 output_root=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490 image=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490\40917f51f55e49acd739ef0b2e8c1490.png
+[2026-04-12 17:16:38,227] WARNING [workflow:4677] No probe outcomes for forward selection at src_sig=767ea300
