@@ -380,7 +380,7 @@ REQUIRED OUTPUT (strict JSON matching NavigationProposal):
    - spam random clicks
    - leave the app intentionally (external links) unless clearly needed for active_topics
 """
-
+#prompt调整
 
 _Q_SYSTEM = """You are LLM2 for questionnaire filling based on CURRENT SCREEN evidence.
 

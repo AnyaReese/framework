@@ -1518,7 +1518,7 @@ class BaseUI:
         - keep XML-derived uist as the backbone
         - attach UIED OCR text onto overlapping existing nodes
         - add UIED merge components as synthetic nodes when XML lacks them
-        - skip the old Paddle OCR path entirely
+        - then run the regular OCR/icon/external-semantic enrichers as a second pass
         """
         # 这是专门给调试阶段准备的“UIED-first”实验入口。
         #
@@ -1562,6 +1562,14 @@ class BaseUI:
                 "UIED attach failed (continuing): screenshot_key=%s",
                 BaseUI._hash_screenshot_full(screenshot_b64),
             )
+
+        try:
+            if screenshot_b64 and BaseUI._needs_ocr(uist):
+                # UIED 先补结构/文本；若页面仍然稀疏，再用常规 OCR 做第二次兜底补全。
+                ocr_items = BaseUI._run_ocr_cached(screenshot_b64, force=False)
+                BaseUI._attach_ocr(uist, ocr_items)
+        except Exception:
+            logger.debug("Fallback OCR attach failed after UIED (continuing)", exc_info=True)
 
         try:
             if screenshot_b64:

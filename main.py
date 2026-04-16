@@ -12,23 +12,31 @@ from appium_android import AndroidAppiumClient
 from gpt_cls import GPTClient
 from questionnaire_state import QuestionnaireState
 from workflow import BudgetConfig, WorkflowRunner
-from trace_callbacks import JsonlTraceCallbacks, NoOpCallbacks
+from trace_callbacks import InteractiveDebugCallbacks, JsonlTraceCallbacks, NoOpCallbacks
 
 from dotenv import load_dotenv
 load_dotenv()
 
 
-def setup_logging(debug: bool, level: str):
-    # Console + file logging with optional verbose debug mode for troubleshooting LLM/Appium issues.
-    level = logging.DEBUG if debug else getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format='[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s',
-        handlers=[
-            logging.FileHandler('app.log', mode='a', encoding='utf-8'),  # Logs to file
-            logging.StreamHandler()  # Logs to console
-        ]
-    )
+def setup_logging(debug: bool, level: str, *, quiet_console: bool = False):
+    # Console + file logging with optional quieter console mode for interactive stepping.
+    root_level = logging.DEBUG if debug else getattr(logging, level.upper(), logging.INFO)
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s')
+
+    root = logging.getLogger()
+    root.setLevel(root_level)
+    root.handlers.clear()
+
+    file_handler = logging.FileHandler('app.log', mode='a', encoding='utf-8')
+    file_handler.setLevel(root_level)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING if quiet_console else root_level)
+    console_handler.setFormatter(formatter)
+
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("selenium").setLevel(logging.WARNING)
 
@@ -64,6 +72,8 @@ def parse_args(argv) -> argparse.Namespace:
     run.add_argument("--time-budget", type=float, default=300.0, help="Total run time budget (seconds)")
     run.add_argument("--max-actions", type=int, default=300, help="Max number of actions (click/back/etc.)")
     run.add_argument("--probe-cap", type=int, default=10, help="Max candidate probes per page")
+    run.add_argument("--disable-probe-return", action="store_true", help="Skip probe-return exploration and commit forward directly")
+    run.add_argument("--min-candidate-score", type=float, default=-1.0, help="Filter out LLM1 candidates with score below this threshold before probe/forward")
     run.add_argument("--workers", type=int, default=4, help="Thread pool workers (LLM overlap)")
 
     # Model
@@ -78,6 +88,11 @@ def parse_args(argv) -> argparse.Namespace:
     run.add_argument("--log-level", type=str, default="INFO", help="Logging level (DEBUG/INFO/WARNING)")
     run.add_argument("--debug", action="store_true")
     run.add_argument("--pause", action="store_true")
+    run.add_argument(
+        "--interactive-debug",
+        action="store_true",
+        help="Use concise Chinese step-by-step console output and wait for a key between major steps",
+    )
 
     lp = sub.add_parser("list-packages", help="List installed packages")
     lp.add_argument("--device-name", default=None)
@@ -109,8 +124,8 @@ def parse_args(argv) -> argparse.Namespace:
 # package = "com.android.settings"
 
 # package = "com.calcitem.sanmill"
-package = "bim.app"
-# package = "com.marktka.calculatorYou"
+# package = "bim.app"
+package = "com.marktka.calculatorYou"
 
 
 sys.argv = [sys.argv[0], 
@@ -124,13 +139,20 @@ sys.argv = [sys.argv[0],
             "--trace-dir", "./traces/",
             "--run-id", time.strftime("%Y%m%d_%H%M%S") + "_" + package,
             #"--pause",
+            "--interactive-debug",
+            "--disable-probe-return",
+            "--min-candidate-score", "0.0",
             "--relaunch", "--debug"]
 #============================
 def main(argv=None):
     # WHEN CALLED: process entry; sets up logging, loads questionnaires, initializes Appium/GPT, and calls WorkflowRunner.run.
     # POSITION: only place run() is invoked; other subcommands bypass workflow and perform utility actions.
     args = parse_args(argv or sys.argv[1:])
-    setup_logging(getattr(args, "debug", False), getattr(args, "level", "INFO"))
+    setup_logging(
+        getattr(args, "debug", False),
+        getattr(args, "log_level", "INFO"),
+        quiet_console=bool(getattr(args, "interactive_debug", False)),
+    )
     logger = logging.getLogger(__name__)
 
     if args.cmd == "run":
@@ -150,11 +172,18 @@ def main(argv=None):
         budget = BudgetConfig(
             time_budget_s=float(args.time_budget),
             max_actions=int(args.max_actions),
+            enable_probe_return=not bool(args.disable_probe_return),
+            min_candidate_score=float(args.min_candidate_score),
             per_page_probe_cap=int(args.probe_cap),
             max_workers=int(args.workers),
         )
 
-        callbacks = JsonlTraceCallbacks(args.trace_dir, args.run_id) if args.trace_dir else NoOpCallbacks()
+        if args.interactive_debug:
+            callbacks = InteractiveDebugCallbacks()
+        elif args.trace_dir:
+            callbacks = JsonlTraceCallbacks(args.trace_dir, args.run_id)
+        else:
+            callbacks = NoOpCallbacks()
 
         runner = WorkflowRunner(
             appium=appium,
@@ -203,5 +232,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
-

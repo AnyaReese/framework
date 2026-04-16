@@ -72,6 +72,173 @@ class NoOpCallbacks:
         return None
 
 
+class InteractiveDebugCallbacks(NoOpCallbacks):
+    """Print concise Chinese step summaries and wait for a key between steps."""
+
+    manages_action_pause = True
+
+    def __init__(self, *, pause_on: Optional[List[str]] = None) -> None:
+        self.pause_on = set(
+            pause_on
+            or [
+                "snapshot",
+                "llm_result",
+                "action_before",
+                "action_after",
+                "transition",
+                "questionnaire_update",
+                "decision",
+            ]
+        )
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        with self._lock:
+            self._seq += 1
+            return self._seq
+
+    def _short_sig(self, sig: Any) -> str:
+        text = str(sig or "")
+        return text[:8] if text else "-"
+
+    def _short_text(self, value: Any, limit: int = 80) -> str:
+        text = str(value or "").strip().replace("\n", " ")
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    def _fmt_action(self, action: Dict[str, Any]) -> str:
+        kind = str(action.get("action") or "?")
+        element_id = action.get("element_id")
+        text = self._short_text(action.get("text"), 30)
+        parts = [kind]
+        if element_id is not None:
+            parts.append(f"id={element_id}")
+        if text:
+            parts.append(f"text={text}")
+        return " ".join(parts)
+
+    def _fmt_json(self, payload: Dict[str, Any], limit: int = 160) -> str:
+        return self._short_text(json.dumps(payload, ensure_ascii=False), limit)
+
+    def _print_block(self, title: str, lines: List[str], *, pause_key: Optional[str] = None) -> None:
+        idx = self._next_seq()
+        print(f"\n[{idx:03d}] {title}")
+        for line in lines:
+            print(f"  {line}")
+        if pause_key and pause_key in self.pause_on:
+            self._wait_for_key()
+
+    def _wait_for_key(self) -> None:
+        prompt = "  按任意键继续..."
+        if os.name == "nt":
+            try:
+                import msvcrt
+
+                print(prompt, end="", flush=True)
+                msvcrt.getwch()
+                print("")
+                return
+            except Exception:
+                pass
+        input(f"{prompt}（或直接回车）")
+
+    def on_snapshot(self, ctx: StepCtx, snap: Dict[str, Any]) -> None:  # type: ignore[override]
+        meta = snap.get("meta") or {}
+        vid_count = len(snap.get("vid_map") or {})
+        root_count = len((snap.get("uist") or {}).get("elements") or [])
+        self._print_block(
+            "快照",
+            [
+                f"step_id={ctx.step_id} sig={self._short_sig(snap.get('state_sig'))} stack_depth={len(ctx.stack)}",
+                f"前台包={meta.get('foreground_package') or '-'} activity={meta.get('foreground_activity') or '-'}",
+                f"元素数={vid_count} 根节点数={root_count} cache_hit={bool(meta.get('cache_hit'))}",
+            ],
+            pause_key="snapshot",
+        )
+
+    def on_llm_result(self, ctx: StepCtx, kind: str, result: Dict[str, Any]) -> None:  # type: ignore[override]
+        keys = sorted(result.keys())
+        self._print_block(
+            f"LLM结果: {kind}",
+            [
+                f"sig={self._short_sig(ctx.cur_sig)} 字段={', '.join(keys[:8]) or '-'}",
+                f"摘要={self._short_text(json.dumps(result, ensure_ascii=False), 160)}",
+            ],
+            pause_key="llm_result",
+        )
+
+    def on_action(self, ctx: StepCtx, action: Dict[str, Any], phase: str, extra: Dict[str, Any]) -> None:  # type: ignore[override]
+        origin = str(extra.get("origin") or "-")
+        reasoning = self._short_text(extra.get("reasoning"), 100) or "-"
+        if phase == "before":
+            self._print_block(
+                "动作准备",
+                [
+                    f"sig={self._short_sig(ctx.cur_sig)} 动作={self._fmt_action(action)}",
+                    f"来源函数={origin}",
+                    f"执行原因={reasoning}",
+                    f"附加信息={self._fmt_json(extra, 140)}",
+                ],
+                pause_key="action_before",
+            )
+            return
+
+        self._print_block(
+            "动作结果",
+            [
+                f"sig={self._short_sig(ctx.cur_sig)} 动作={self._fmt_action(action)}",
+                f"来源函数={origin}",
+                f"执行原因={reasoning}",
+                f"结果={self._fmt_json(extra, 140)}",
+            ],
+            pause_key="action_after",
+        )
+
+    def on_transition(self, ctx: StepCtx, tr: Dict[str, Any]) -> None:  # type: ignore[override]
+        self._print_block(
+            "状态迁移",
+            [
+                f"kind={tr.get('kind') or '-'} src={self._short_sig(tr.get('src'))} dst={self._short_sig(tr.get('dst') or tr.get('sig'))}",
+                f"详情={self._short_text(json.dumps(tr, ensure_ascii=False), 160)}",
+            ],
+            pause_key="transition",
+        )
+
+    def on_questionnaire_update(self, ctx: StepCtx, upd: Dict[str, Any]) -> None:  # type: ignore[override]
+        self._print_block(
+            "问卷更新",
+            [
+                f"sig={self._short_sig(ctx.cur_sig)}",
+                f"详情={self._short_text(json.dumps(upd, ensure_ascii=False), 160)}",
+            ],
+            pause_key="questionnaire_update",
+        )
+
+    def on_decision(self, ctx: StepCtx, name: str, detail: Dict[str, Any]) -> None:  # type: ignore[override]
+        if name == "next_step":
+            plan = str(detail.get("plan") or "-")
+            self._print_block(
+                "下一步计划",
+                [
+                    f"当前sig={self._short_sig(ctx.cur_sig)}",
+                    f"计划={plan}",
+                    f"详情={self._short_text(json.dumps(detail, ensure_ascii=False), 220)}",
+                ],
+                pause_key="decision",
+            )
+            return
+        self._print_block(
+            f"流程决策: {name}",
+            [
+                f"sig={self._short_sig(ctx.cur_sig)} gaps={len(ctx.open_gaps)} answered={ctx.answered_ratio:.2f}",
+                f"详情={self._short_text(json.dumps(detail, ensure_ascii=False), 220)}",
+            ],
+            pause_key="decision",
+        )
+
+
 class JsonlTraceCallbacks(NoOpCallbacks):
     """Persist events + large blobs to disk for offline replay/metrics."""
 

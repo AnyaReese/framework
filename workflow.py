@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -54,6 +55,8 @@ from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from collections import OrderedDict, deque
 
+import cv2
+import numpy as np
 from PIL import Image
 
 from appium_android import AndroidAppiumClient
@@ -88,6 +91,7 @@ class BudgetConfig:
     stuck_loops_limit: int = 18             # consecutive no-progress loops -> recover (if NAV ready)
 
     # Per-page probing (bounded per loop; across loops we exhaust remaining candidates)
+    enable_probe_return: bool = True
     per_page_probe_cap: int = 10
     post_action_settle_s: float = 0.6
 
@@ -107,6 +111,7 @@ class BudgetConfig:
 
     # Forward scoring weights
     cand_score_weight: float = 3.0  # LLM candidate score in [-1,1] -> [-3,3] influence (minor vs novelty/q-yield)
+    min_candidate_score: float = -1.0  # LLM1 candidates below this score are filtered before probe/forward.
 
     # Beam-first global switching
     beam_width: int = 10
@@ -496,6 +501,7 @@ class WorkflowRunner:
     # Debug-only: recent observed states (should NOT affect graph visit_count)
     recent_states: List[str] = field(default_factory=list, init=False)
     sig_to_family: Dict[str, str] = field(default_factory=dict, init=False)
+    visual_state_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
 
     # Restart baselines for replay
     entry_sig: str = ""
@@ -671,6 +677,32 @@ class WorkflowRunner:
             logger.info(json.dumps(payload, ensure_ascii=False))
         except Exception:
             logger.debug("log_event failed", exc_info=True)
+
+    def _infer_action_origin(self) -> str:
+        """
+        Best-effort caller attribution for debugging action execution.
+        """
+        interesting = {
+            "_probe_candidates",
+            "_return_to_expected",
+            "_dismiss_overlay_with_nav",
+            "_handle_loading_overlay",
+            "_backtrace_to",
+            "_recover",
+            "_restart_and_replay",
+            "_navigate_via_graph",
+            "_execute_action_payload",
+            "_replay_actions_to_target",
+            "run",
+        }
+        try:
+            for frame_info in inspect.stack()[1:12]:
+                fn = str(frame_info.function or "")
+                if fn in interesting:
+                    return fn
+        except Exception:
+            return "unknown"
+        return "unknown"
 
     def _mark_progress(self, kind: str, detail: Optional[Dict[str, Any]] = None) -> None:
         now = time.time()
@@ -965,6 +997,11 @@ class WorkflowRunner:
             # - may wait; may detect drift while waiting; may timeout -> heuristics
             # 在根节点适当放宽等待时间，给首页导航分析更多时间。
             timeout_s = self.budget.nav_timeout_s + (30.0 if len(self.dfs_stack) == 1 else 0.0)
+            self._emit_decision(
+                cur_sig,
+                "next_step",
+                {"plan": "wait_nav_or_fallback", "timeout_s": timeout_s, "stack_depth": len(self.dfs_stack)},
+            )
             # 等待 NAV 结果；如果超时或进入 cooldown，则允许走启发式候选。
             nav, using_heuristics = self._wait_nav_or_fallback(cur_sig, snap, task, timeout_s=timeout_s)
 
@@ -1058,6 +1095,16 @@ class WorkflowRunner:
             # Candidates: NAV if available; heuristics ONLY if NAV timed out/cooldown.
             # 生成本轮可尝试的候选动作；优先使用 NAV 结果，只有 NAV 不可用时才退化到启发式。
             candidates = self._candidate_actions(nav=nav, snap=snap, allow_heuristics=using_heuristics)
+            self._emit_decision(
+                cur_sig,
+                "next_step",
+                {
+                    "plan": "evaluate_candidates",
+                    "candidate_count": len(candidates or []),
+                    "using_heuristics": bool(using_heuristics),
+                    "overlay_kind": overlay_kind,
+                },
+            )
             # 如果本轮拿到的是正常 NAV 结果，就顺手检查候选是否还有真正可用的动作。
             if nav is not None and (not using_heuristics):
                 # 统计有没有至少一个候选动作还没被探索、尝试或拉黑。
@@ -1092,11 +1139,20 @@ class WorkflowRunner:
 
             # Probe-return exploration (evidence gathering for forward scoring)
             # 先对候选做 probe 探测，而不是立刻前进；目的是先知道这些动作分别会通向哪里。
-            self._probe_candidates(cur_sig, snap, nav, candidates, task)
+            if self.budget.enable_probe_return:
+                self._emit_decision(
+                    cur_sig,
+                    "next_step",
+                    {"plan": "probe_candidates", "candidate_count": len(candidates or []), "probe_cap": int(self.budget.per_page_probe_cap)},
+                )
+                self._probe_candidates(cur_sig, snap, nav, candidates, task)
+            else:
+                self._log_event("probe_skipped", sig=cur_sig, reason="probe_return_disabled")
+                self._emit_decision(cur_sig, "probe_skipped", {"reason": "probe_return_disabled"})
 
             # Probe can request forced replan (back-like / return_method=none / source mismatch)
             # probe 期间如果发现“实际上已经跳走了”，这里会触发强制重规划。
-            if self._consume_forced_replan():
+            if self.budget.enable_probe_return and self._consume_forced_replan():
                 # 切换到 probe 过程确定的新状态与快照。
                 cur_sig, snap = self._force_replan_sig, self._force_replan_snap  # type: ignore[assignment]
                 # 读取是否已有记录边。
@@ -1112,10 +1168,12 @@ class WorkflowRunner:
 
             # Optional post-probe wait (let pipelined Q updates land)
             # probe 之后可短暂等待一下，让刚刚 pipeline 出去的问卷更新任务有时间完成并落回状态。
-            self._post_probe_wait()
+            if self.budget.enable_probe_return:
+                self._post_probe_wait()
 
             # Choose forward commit based on probe evidence + novelty + questionnaire yield.
             # 基于 probe 的落点、新颖度、问卷收益等信息，挑出本轮真正要 commit 的前进动作。
+            self._emit_decision(cur_sig, "next_step", {"plan": "choose_forward"})
             forward = self._choose_forward(cur_sig, nav, candidates=candidates)
 
             # Beam switching compares against a *verified* local option only.
@@ -1173,6 +1231,7 @@ class WorkflowRunner:
                         # 记录回溯目标。
                         logger.info("Exhausted sig=%s. Backtrace to ancestor sig=%s.", cur_sig[:8], target[:8])
                         # 试着按 DFS 路径退回去。
+                        self._emit_decision(cur_sig, "next_step", {"plan": "backtrace_to_ancestor", "target_sig": target})
                         ok = self._backtrace_to(target_sig=target, task=task, start_snap=snap)
                         # 如果回溯失败，则进入恢复流程。
                         if not ok:
@@ -1202,6 +1261,7 @@ class WorkflowRunner:
                         # 记录准备前往全局 frontier。
                         logger.info("No ancestor work. Attempt to reach global frontier sig=%s", frontier[:8])
                         # 先尝试不重启，直接沿已知状态图导航过去。
+                        self._emit_decision(cur_sig, "next_step", {"plan": "navigate_to_global_frontier", "target_sig": frontier})
                         reached, snap2 = self._navigate_via_graph(start_sig=cur_sig, start_snap=snap, target_sig=frontier, task=task)
                         # 如果状态图导航失败，则升级到重启 + replay。
                         if not reached:
@@ -1231,6 +1291,11 @@ class WorkflowRunner:
                     # 把 stuck 事件写入日志与 trace。
                     self._log_event("stuck_detected", sig=cur_sig, loops=self.no_progress_loops, age_s=(time.time() - self.last_strong_progress_ts))
                     # 尝试 recovery，把流程拉回一个可继续探索的状态。
+                    self._emit_decision(
+                        cur_sig,
+                        "next_step",
+                        {"plan": "recover_stuck", "loops": self.no_progress_loops, "age_s": (time.time() - self.last_strong_progress_ts)},
+                    )
                     ok = self._recover(cur_sig, snap, reason=RecoveryReason.STUCK_NO_PROGRESS, task=task, target_sig=None)
                     # recovery 失败则走重启恢复。
                     if not ok:
@@ -1257,6 +1322,11 @@ class WorkflowRunner:
             # 取出第一步动作附带的 reasoning，方便日志里看到“为什么选它”。
             first_reason = (forward.actions[0].reasoning if forward.actions else "") or ""
             # 记录本轮前进提交的候选动作。
+            self._emit_decision(
+                cur_sig,
+                "next_step",
+                {"plan": "forward_commit", "candidate_key": cand_key, "reason": first_reason, "actions": self._actions_signature(forward.actions)},
+            )
             logger.info("Forward commit from sig=%s: %s (%s)", cur_sig[:8], cand_key, first_reason[:90])
             # 如果有上一轮 forward 评分细节，也一起落到 trace 里。
             if self._last_forward_detail:
@@ -2080,6 +2150,134 @@ class WorkflowRunner:
         bundle = BaseUI.postprocess_version_bundle()
         m3 = hashlib.md5(bundle.encode("utf-8")).hexdigest()
         return f"{xml_hash}:{screenshot_hash}:{float(coord_scale or 1.0):.4f}:{m3}:{str(foreground_package or '')}:{str(foreground_activity or '')}"
+
+    @staticmethod
+    def _state_sig_from_xml(xml_state_sig: str) -> str:
+        xml_state_sig = str(xml_state_sig or "").strip()
+        return f"xml:{xml_state_sig}" if xml_state_sig else ""
+
+    @staticmethod
+    def _state_sig_from_phash(screenshot_phash: str, *, foreground_package: str = "", foreground_activity: str = "") -> str:
+        blob = json.dumps(
+            {
+                "foreground_package": str(foreground_package or ""),
+                "foreground_activity": str(foreground_activity or ""),
+                "screenshot_phash": str(screenshot_phash or ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return f"phash:{hashlib.md5(blob.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _family_sig_from_struct(struct_sig: str) -> str:
+        struct_sig = str(struct_sig or "").strip()
+        return f"struct:{struct_sig}" if struct_sig else ""
+
+    def _resolve_state_identity(
+        self,
+        *,
+        xml_reliable: bool,
+        xml_state_sig: str,
+        struct_sig: str,
+        screenshot_phash: str,
+        foreground_package: str = "",
+        foreground_activity: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Select the canonical state key used everywhere else in the workflow.
+
+        POLICY:
+          - Reliable XML: keep using XML-derived state signature.
+          - Unreliable XML: switch to a screenshot-phash-backed signature and
+            reuse an existing visual state when similarity is high enough.
+        """
+        xml_state_sig = str(xml_state_sig or "")
+        struct_sig = str(struct_sig or "")
+        screenshot_phash = str(screenshot_phash or "")
+        foreground_package = str(foreground_package or "")
+        foreground_activity = str(foreground_activity or "")
+
+        if xml_reliable and xml_state_sig:
+            state_sig = self._state_sig_from_xml(xml_state_sig)
+            family_sig = self._family_sig_from_struct(struct_sig) or state_sig
+            return {
+                "state_sig": state_sig,
+                "family_sig": family_sig,
+                "identity_source": "xml",
+                "identity_hash": xml_state_sig,
+                "matched_existing": False,
+                "matched_similarity": 1.0,
+            }
+
+        if screenshot_phash:
+            best_sig = ""
+            best_similarity = -1.0
+            for known_sig, meta in self.visual_state_registry.items():
+                if str(meta.get("identity_source") or "") != "phash":
+                    continue
+                if str(meta.get("foreground_package") or "") != foreground_package:
+                    continue
+                if str(meta.get("foreground_activity") or "") != foreground_activity:
+                    continue
+                known_phash = str(meta.get("screenshot_phash") or "")
+                if not known_phash:
+                    continue
+                sim = compare_phash_similarity(screenshot_phash, known_phash)
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_sig = known_sig
+            if best_sig and best_similarity >= float(self.budget.screenshot_phash_similarity_threshold):
+                self.visual_state_registry[best_sig] = {
+                    "identity_source": "phash",
+                    "screenshot_phash": screenshot_phash,
+                    "foreground_package": foreground_package,
+                    "foreground_activity": foreground_activity,
+                    "last_similarity": best_similarity,
+                    "updated_ts": time.time(),
+                }
+                return {
+                    "state_sig": best_sig,
+                    "family_sig": best_sig,
+                    "identity_source": "phash",
+                    "identity_hash": screenshot_phash,
+                    "matched_existing": True,
+                    "matched_similarity": best_similarity,
+                }
+
+            state_sig = self._state_sig_from_phash(
+                screenshot_phash,
+                foreground_package=foreground_package,
+                foreground_activity=foreground_activity,
+            )
+            self.visual_state_registry[state_sig] = {
+                "identity_source": "phash",
+                "screenshot_phash": screenshot_phash,
+                "foreground_package": foreground_package,
+                "foreground_activity": foreground_activity,
+                "last_similarity": 1.0,
+                "updated_ts": time.time(),
+            }
+            return {
+                "state_sig": state_sig,
+                "family_sig": state_sig,
+                "identity_source": "phash",
+                "identity_hash": screenshot_phash,
+                "matched_existing": False,
+                "matched_similarity": 1.0,
+            }
+
+        # Last-resort fallback: keep the XML signature so the workflow still has a state key.
+        state_sig = self._state_sig_from_xml(xml_state_sig)
+        family_sig = self._family_sig_from_struct(struct_sig) or state_sig
+        return {
+            "state_sig": state_sig,
+            "family_sig": family_sig,
+            "identity_source": "xml_fallback",
+            "identity_hash": xml_state_sig,
+            "matched_existing": False,
+            "matched_similarity": 0.0,
+        }
 
     def _preflight_refresh_if_changed(self, snap: Dict[str, Any], *, timeout_s: float = 0.5) -> Optional[Dict[str, Any]]:
         """
@@ -3111,6 +3309,46 @@ class WorkflowRunner:
     # Candidate selection
     # ---------------------------
 
+    def _filter_nav_candidates(self, sig: str, candidates: List[ActionCandidate]) -> List[ActionCandidate]:
+        threshold = float(self.budget.min_candidate_score)
+        if threshold <= -1.0:
+            return list(candidates or [])
+
+        kept: List[ActionCandidate] = []
+        dropped: List[Dict[str, Any]] = []
+        for cand in list(candidates or []):
+            score = float(getattr(cand, "score", 0.0) or 0.0)
+            if score < threshold:
+                dropped.append(
+                    {
+                        "action_key": self._candidate_key(cand) if getattr(cand, "actions", None) else "",
+                        "score": score,
+                    }
+                )
+                continue
+            kept.append(cand)
+
+        if dropped:
+            self._log_event(
+                "candidate_score_filtered",
+                sig=sig,
+                threshold=threshold,
+                kept=len(kept),
+                dropped=len(dropped),
+                dropped_preview=dropped[:5],
+            )
+            self._emit_decision(
+                sig,
+                "candidate_score_filtered",
+                {
+                    "threshold": threshold,
+                    "kept": len(kept),
+                    "dropped": len(dropped),
+                    "dropped_preview": dropped[:5],
+                },
+            )
+        return kept
+
     def _candidate_actions(self, nav: Optional[NavigationProposal], snap: Dict[str, Any], allow_heuristics: bool) -> List[ActionCandidate]:
         """
         WHEN called:
@@ -3121,7 +3359,8 @@ class WorkflowRunner:
           - Heuristics ONLY if allow_heuristics==True (NAV timed out)
         """
         if nav and getattr(nav, "candidate_actions", None):
-            return getattr(nav, "candidate_actions") or []
+            sig = str(snap.get("state_sig") or "")
+            return self._filter_nav_candidates(sig, list(getattr(nav, "candidate_actions") or []))
 
         if not allow_heuristics:
             return []
@@ -3422,24 +3661,79 @@ class WorkflowRunner:
             return False
         cur_sig = str(cur.get("state_sig") or "")
 
+        self._emit_decision(
+            cur_sig,
+            "probe_return_start",
+            {
+                "expected_sig": expected_sig,
+                "expected_struct_sig": expected_struct_sig or "",
+                "return_method": return_method,
+                "return_actions_count": len(return_actions or []),
+            },
+        )
+
         # Fast check: sometimes already returned.
         if matches(cur):
+            self._emit_decision(cur_sig, "probe_return_already_matched", {"expected_sig": expected_sig})
             return True
 
-        def apply_step(step: ActionStep, *, kind: str) -> Optional[Dict[str, Any]]:
+        def apply_step(step: ActionStep, *, kind: str, why: str) -> Optional[Dict[str, Any]]:
             nonlocal cur, cur_sig
             pre_sig = cur_sig
+            self._emit_decision(
+                pre_sig,
+                "probe_return_step",
+                {
+                    "kind": kind,
+                    "why": why,
+                    "return_method": return_method,
+                    "action": self._action_signature(step),
+                },
+            )
             ok = self._execute_action(step, cur.get("vid_map") or {}, pre_sig)
             if not ok:
+                self._emit_decision(
+                    pre_sig,
+                    "probe_return_step_failed",
+                    {
+                        "kind": kind,
+                        "why": why,
+                        "return_method": return_method,
+                        "action": self._action_signature(step),
+                        "last_action_failure": dict(self.last_action_failure or {}),
+                    },
+                )
                 return None
             self.action_count += 1
             self.history.append(self._action_key(step))
             time.sleep(self.budget.post_action_settle_s)
             nxt = self._capture_and_process()
             if not nxt:
+                self._emit_decision(
+                    pre_sig,
+                    "probe_return_capture_failed",
+                    {
+                        "kind": kind,
+                        "why": why,
+                        "return_method": return_method,
+                        "action": self._action_signature(step),
+                    },
+                )
                 return None
             nxt_sig = str(nxt.get("state_sig") or "")
             self._graph_record_aux_transition(pre_sig, nxt_sig, self._actions_signature([step]), kind=kind)
+            self._emit_decision(
+                pre_sig,
+                "probe_return_step_result",
+                {
+                    "kind": kind,
+                    "why": why,
+                    "return_method": return_method,
+                    "from_sig": pre_sig,
+                    "to_sig": nxt_sig,
+                    "matched_expected": bool(matches(nxt)),
+                },
+            )
             cur = nxt
             cur_sig = nxt_sig
             return nxt
@@ -3541,7 +3835,7 @@ class WorkflowRunner:
                             )
                             eff = ActionStep(action=st.action, element_id=new_id, text=st.text, priority=st.priority, reasoning=st.reasoning)
 
-                nxt = apply_step(eff, kind="return")
+                nxt = apply_step(eff, kind="return", why="llm_return_actions")
                 if nxt and matches(nxt):
                     return True
 
@@ -3550,7 +3844,7 @@ class WorkflowRunner:
             tab_ids = self._heuristic_tab_elements(cur.get("vid_map") or {})
             for eid in tab_ids[:4]:
                 st = ActionStep(action=ActionType.CLICK, element_id=eid, priority=1, reasoning="heuristic_tab_back")
-                nxt = apply_step(st, kind="return")
+                nxt = apply_step(st, kind="return", why="heuristic_tab_back")
                 if nxt and matches(nxt):
                     return True
 
@@ -3559,7 +3853,7 @@ class WorkflowRunner:
             close_ids = self._heuristic_close_elements(cur.get("vid_map") or {})
             for eid in close_ids[:3]:
                 st = ActionStep(action=ActionType.CLICK, element_id=eid, priority=1, reasoning="heuristic_close")
-                nxt = apply_step(st, kind="return")
+                nxt = apply_step(st, kind="return", why="heuristic_close")
                 if nxt and matches(nxt):
                     return True
 
@@ -3569,7 +3863,7 @@ class WorkflowRunner:
 
         for _ in range(back_attempts):
             st = ActionStep(action=ActionType.BACK, element_id=None, priority=1, reasoning="return_back")
-            nxt = apply_step(st, kind="return")
+            nxt = apply_step(st, kind="return", why="back_fallback_primary")
             if (self.last_action_failure or {}).get("reason") == "back_blocked_settings_root":
                 return False
             if nxt and matches(nxt):
@@ -3578,7 +3872,7 @@ class WorkflowRunner:
         # If return_method wasn't "back" and we still didn't reach, try one more BACK as last resort
         if not back_first:
             st = ActionStep(action=ActionType.BACK, element_id=None, priority=1, reasoning="return_back_last")
-            nxt = apply_step(st, kind="return")
+            nxt = apply_step(st, kind="return", why="back_fallback_last_resort")
             if (self.last_action_failure or {}).get("reason") == "back_blocked_settings_root":
                 return False
             if nxt and matches(nxt):
@@ -5349,9 +5643,15 @@ class WorkflowRunner:
         try:
             sig_for_trace = cur_sig or (self.recent_states[-1] if self.recent_states else "")
             action_sig = self._action_signature(step)
-            self._emit_action(sig_for_trace, action_sig, "before", {"has_element": step.element_id in vid_map})
+            origin = self._infer_action_origin()
+            common_extra = {
+                "reasoning": step.reasoning or "",
+                "origin": origin,
+                "action_key": self._action_key(step),
+            }
+            self._emit_action(sig_for_trace, action_sig, "before", {"has_element": step.element_id in vid_map, **common_extra})
             logger.debug("Executing action: %s on element %s", self._action_key(step), str(vid_map.get(step.element_id or -1, {}) | {"subviews": {}}))
-            if self.pause:
+            if self.pause and not getattr(self.callbacks, "manages_action_pause", False):
                 input("Paused before action execution. Press Enter to continue...")
 
             self.last_action_failure = None
@@ -5377,7 +5677,7 @@ class WorkflowRunner:
                             self.foreground_recoveries += 1
                     except Exception:
                         pass
-                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "foreground_mismatch"})
+                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "foreground_mismatch", **common_extra})
                     return False
 
             if step.action == ActionType.CLICK:
@@ -5385,11 +5685,11 @@ class WorkflowRunner:
                 if not node:
                     logger.debug("CLICK failed: element_id=%s not in vid_map", step.element_id)
                     self.last_action_failure = {"reason": "missing_element", "action": self._action_signature(step)}
-                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "missing_element"})
+                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "missing_element", **common_extra})
                     return False
                 try:
                     if self._try_click_stable(node):
-                        self._emit_action(sig_for_trace, action_sig, "after", {"success": True, "via": "stable_selector"})
+                        self._emit_action(sig_for_trace, action_sig, "after", {"success": True, "via": "stable_selector", **common_extra})
                         return True
                 except Exception:
                     # Fall back to coordinate tap below.
@@ -5400,11 +5700,11 @@ class WorkflowRunner:
                 if w <= 1 or h <= 1:
                     logger.debug("CLICK failed: degenerate bounds id=%s w=%.1f h=%.1f", step.element_id, w, h)
                     self.last_action_failure = {"reason": "degenerate_bounds", "action": self._action_signature(step)}
-                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "degenerate_bounds"})
+                    self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "degenerate_bounds", **common_extra})
                     return False
                 c = BaseUI.get_center(node)
                 self.appium.tap(c["x"], c["y"])
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 
             if step.action == ActionType.BACK:
@@ -5415,7 +5715,7 @@ class WorkflowRunner:
                     if node:
                         c = BaseUI.get_center(node)
                         self.appium.tap(c["x"], c["y"])
-                        self._emit_action(sig_for_trace, action_sig, "after", {"success": True, "via": "navigate_up"})
+                        self._emit_action(sig_for_trace, action_sig, "after", {"success": True, "via": "navigate_up", **common_extra})
                         return True
 
                 # Settings root safety: never press system BACK from the top activity (would exit to launcher),
@@ -5429,11 +5729,11 @@ class WorkflowRunner:
                     if not ok_overlay:
                         self.last_action_failure = {"reason": "back_blocked_settings_root", "action": self._action_signature(step)}
                         self._log_event("back_blocked_settings_root", sig=sig_for_trace, action=self._action_signature(step))
-                        self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "back_blocked_settings_root"})
+                        self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "back_blocked_settings_root", **common_extra})
                         return False
 
                 self.appium.back()
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 
             if step.action == ActionType.WAIT:
@@ -5444,7 +5744,7 @@ class WorkflowRunner:
                     except (TypeError, ValueError):
                         seconds = 0.7
                 time.sleep(seconds)
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 
             if step.action == ActionType.INPUT:
@@ -5459,7 +5759,7 @@ class WorkflowRunner:
                         self.appium.tap(c["x"], c["y"])
                     time.sleep(0.2)
                 self.appium.type_text(step.text or "")
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 
             if step.action == ActionType.RESTART:
@@ -5468,21 +5768,32 @@ class WorkflowRunner:
                     time.sleep(0.6)
                     self.appium.ensure_foreground(self.target_package, self.target_activity)
                     time.sleep(0.8)
-                    self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                    self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                     return True
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "no_target_package"})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": False, "reason": "no_target_package", **common_extra})
                 return False
 
             if step.action in (ActionType.NONE, ActionType.COMPLETE):
-                self._emit_action(sig_for_trace, action_sig, "after", {"success": True})
+                self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 
-            self._emit_action(sig_for_trace, action_sig, "after", {"success": False})
+            self._emit_action(sig_for_trace, action_sig, "after", {"success": False, **common_extra})
             return False
         except Exception:
             logger.debug("execute_action error", exc_info=True)
             sig_for_trace = cur_sig or (self.recent_states[-1] if self.recent_states else "")
-            self._emit_action(sig_for_trace, self._action_signature(step), "after", {"success": False, "exception": True})
+            self._emit_action(
+                sig_for_trace,
+                self._action_signature(step),
+                "after",
+                {
+                    "success": False,
+                    "exception": True,
+                    "reasoning": step.reasoning or "",
+                    "origin": locals().get("origin", "unknown"),
+                    "action_key": self._action_key(step),
+                },
+            )
             return False
 
     # ---------------------------
