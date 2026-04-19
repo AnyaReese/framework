@@ -265,6 +265,34 @@ class TopicRouteResult(BaseModel):
     followups: List[str] = Field(default_factory=list, description="Optional followups like 'open Settings > Privacy'")
 
 
+class RouterQuestionAnswer(BaseModel):
+    """
+    One router-question update inferred from the current screen.
+
+    Notes:
+      - This is still a questionnaire question, so question_id must be an existing router question id.
+      - new_answer follows the same single/multi conventions as QuestionnaireUpdate.
+    """
+    question_id: str = Field(..., description="Router question id from router_questions input")
+    new_answer: Union[str, List[str], None] = Field(
+        None,
+        description="For single-select use ONE option id/value string; for multi-select use a list of option ids/values.",
+    )
+    confidence: float = Field(0.0, ge=0.0, le=1.0, description="0-1 confidence for this router answer")
+    rationale: str = Field("", description="Short justification from the current UI (<=1 sentence)")
+
+
+class RouterResult(BaseModel):
+    """
+    New LLM2-1 output for the router-only execution view.
+    """
+    state_sig: str = Field(..., description="Echo input state_sig for staleness/debug")
+    router_updates: List[RouterQuestionAnswer] = Field(
+        default_factory=list,
+        description="Router questions that can be answered from the current screen",
+    )
+
+
 def _safe_json_from_text(text: str) -> Dict[str, Any]:
     if not text:
         raise ValueError("Empty model output")
@@ -423,6 +451,30 @@ OUTPUT (strict JSON matching TopicRouteResult):
 RULES:
 - Prefer precision over recall. If unsure, omit.
 - Do not invent topic_ids.
+"""
+
+# 新的LLM2-1
+_ROUTER_SYSTEM = """You are LLM2-1 (Router Filler) for an Android UI exploration agent.
+
+GOAL:
+- Answer only the provided router questions when the current screen gives clear evidence.
+
+INPUTS:
+- state_sig: UI signature for staleness/debug
+- router_questions: router question entries {question_id,router_name?,question,type,options}
+- screenshot: the current UI screenshot; this is the primary evidence source
+
+OUTPUT (strict JSON matching RouterResult):
+- router_updates: 0..12 router answers, each with:
+  - question_id (must exist in router_questions)
+  - new_answer
+  - confidence
+  - rationale(<=1 sentence)
+
+RULES:
+- Prefer precision over recall. If unsure, omit.
+- Do not invent question_ids.
+- If the current screen does not contain enough evidence for a router question, skip that question and do not include it in router_updates.
 """
 
 
@@ -638,6 +690,46 @@ class GPTClient:
         return out
 
     @time_consumed
+    def propose_router_answers(
+        self,
+        screenshot_b64: str,
+        router_questions: List[Dict[str, Any]],
+        state_sig: str = "",
+    ) -> RouterResult:
+        """
+        New LLM2-1 for the router-only execution view.
+
+        Inputs:
+        - screenshot_b64: current screen screenshot, primary evidence source
+        - router_questions: executable router questions extracted from questionnaire_routers.json
+        - state_sig: current page state signature
+
+        Output:
+        - RouterResult:
+          - router_updates: only the router questions answerable on this screen
+        """
+        payload = {
+            "state_sig": state_sig,
+            "router_questions": router_questions[:40],
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _ROUTER_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, RouterResult, opname="propose_router_answers")
+        out.router_updates = list(out.router_updates or [])[:12]
+        out.state_sig = state_sig or out.state_sig
+        return out
+
+    @time_consumed
     def recover_state(
         self,
         screenshot_b64: str,
@@ -758,5 +850,7 @@ __all__ = [
     "QuestionnaireUpdate",
     "TopicRouteResult",
     "RelevantTopic",
+    "RouterResult",
+    "RouterQuestionAnswer",
     "ProposedUpdate",
 ]

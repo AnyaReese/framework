@@ -1,3 +1,5 @@
+# 调试drift检测的代码,第一次按回车记录页面当做初始状态,第二次按回车触发drift检测判断页面是否变化并输出相关信息.
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +20,7 @@ from appium_android import AndroidAppiumClient
 from gpt_cls import GPTClient
 from questionnaire_state import QuestionnaireState
 from trace_callbacks import NoOpCallbacks
-from workflow import BudgetConfig, WorkflowRunner
+from workflow import BudgetConfig, WorkflowRunner, compare_phash_similarity
 
 
 load_dotenv()
@@ -124,12 +126,19 @@ def main() -> int:
 
         input("\n第二步：你现在可以手动保持页面不动，或者切到另一个状态。准备好后按回车开始判断页面是否变化...")
         snap_step2 = runner._capture_and_process()
+        phash_similarity = None
         if snap_step2:
             _save_snap_artifacts(snap_step2, run_dir, "step2_current")
             print(f"step2_state_sig={snap_step2.get('state_sig')}")
             print(f"step2_xml_reliable={snap_step2.get('xml_reliable')}")
             print(f"step2_identity_source={(snap_step2.get('meta') or {}).get('identity_source')}")
             print(f"step2_screenshot_phash={(snap_step2.get('meta') or {}).get('screenshot_phash')}")
+            base_phash = str((snap.get("meta") or {}).get("screenshot_phash") or "")
+            step2_phash = str((snap_step2.get("meta") or {}).get("screenshot_phash") or "")
+            if base_phash and step2_phash:
+                phash_similarity = compare_phash_similarity(base_phash, step2_phash)
+                print(f"step1_vs_step2_phash_similarity={phash_similarity:.4f}")
+                print(f"phash_similarity_threshold={runner.budget.screenshot_phash_similarity_threshold:.4f}")
         else:
             print("第二步页面采集失败，未能保存 step2_current 产物")
 
@@ -150,6 +159,8 @@ def main() -> int:
             print(f"new_screenshot_phash={(refreshed.get('meta') or {}).get('screenshot_phash')}")
             _save_snap_artifacts(refreshed, run_dir, "step2_refreshed")
 
+        if phash_similarity is not None:
+            print(f"printed_step1_vs_step2_phash_similarity={phash_similarity:.4f}")
         print(f"saved_test_dir={run_dir}")
 
         input("\n按回车结束...")

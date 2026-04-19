@@ -449,6 +449,7 @@ def debug_run_test(runner: WorkflowRunner, task: str) -> None:
                         has_page_summary=bool(getattr(nav, "page_summary", "") or ""),
                         tag_count=len(getattr(nav, "page_tags", []) or []),
                     )
+                    print("没找到可执行的动作。")
                     # 发出一个决策事件，标记这次 NAV 结果虽然完成了，但实际不可用。
                     runner._emit_decision(cur_sig, "nav_low_quality", {"candidate_count": len(getattr(nav, "candidate_actions", []) or [])})
 
@@ -493,6 +494,8 @@ def debug_run_test(runner: WorkflowRunner, task: str) -> None:
 
             # Beam switching compares against a *verified* local option only.
             # If forward is speculative (no probe outcome), treat local_score as -inf.
+
+            # 计算当前候选动作的beam_saerch分数
             # 默认把本地候选分数记成负无穷，意思是“还没有足够证据与全局切换比较”。
             local_score = float("-inf")
             # 只有当 forward 候选有明确评分且来自 probe 证据时，才把它当作有效本地方案。
@@ -674,6 +677,7 @@ def debug_run_test(runner: WorkflowRunner, task: str) -> None:
             # 如果连前进后的快照都抓不到，同样需要恢复。
             if not snap_next:
                 # 记录抓取失败。
+                print("动作执行后的页面获取snap失败")
                 logger.warning("Capture failed after forward at sig=%s -> recovery.", cur_sig[:8])
                 # 进入 recovery。
                 runner._recover(cur_sig, snap, reason=RecoveryReason.CAPTURE_FAILED_AFTER_FORWARD, task=task, target_sig=None)
