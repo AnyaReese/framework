@@ -96,15 +96,16 @@ class BudgetConfig:
     post_action_settle_s: float = 0.6
 
     # NAV barrier (wait + drift detection + timeout fallback)
-    nav_timeout_s: float = 18.0
+    nav_timeout_s: float = 30# LLM1检测等待最长时间
     nav_poll_interval_s: float = 0.08
-    nav_drift_check_interval_s: float = 0.9
+    nav_drift_check_interval_s: float = 0.9# 每隔多久进行一次drift检测
     nav_cooldown_s: float = 6.0
     loading_wait_s: float = 6.0
     topic_route_conf_threshold: float = 0.55
     topic_fill_cooldown_s: float = 60.0
     topic_pack_limit: int = 18
-    screenshot_phash_similarity_threshold: float = 0.90# phash相似度判断阈值
+    screenshot_phash_similarity_threshold: float = 0.80# phash相似度判断阈值
+    meaningful_xml_nodes_threshold: int = 2  #计算xml中有意义节点数阈值,用于判断xml是否可信
 
     # Optional short wait after probing to let pipelined analysis land
     post_probe_wait_s: float = 1.2
@@ -411,6 +412,64 @@ def compare_phash_similarity(hash1: str, hash2: str) -> float:
         return 1.0 - (dist / total)
     except Exception:
         return 0.0
+
+
+def count_meaningful_xml_nodes(xml_text: str) -> int:
+    """
+    Count meaningful nodes from Appium XML only.
+
+    Meaningful node:
+    - not fullscreen / near-fullscreen
+    - has text / content-desc / meaningful resource-id / clickable=true
+    """
+    if not xml_text or "<hierarchy" not in xml_text:
+        return 0
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return 0
+
+    screen_w = int(root.attrib.get("width", "0") or 0)
+    screen_h = int(root.attrib.get("height", "0") or 0)
+    count = 0
+
+    for node in root.iter():
+        if node.tag == "hierarchy":
+            continue
+
+        bounds_text = str(node.attrib.get("bounds", "") or "").strip()
+        bounds: Optional[Tuple[int, int, int, int]] = None
+        if bounds_text.startswith("[") and "][" in bounds_text and bounds_text.endswith("]"):
+            try:
+                left, right = bounds_text[1:-1].split("][", 1)
+                x1_s, y1_s = left.split(",", 1)
+                x2_s, y2_s = right.split(",", 1)
+                x1, y1, x2, y2 = int(x1_s), int(y1_s), int(x2_s), int(y2_s)
+                if x2 > x1 and y2 > y1:
+                    bounds = (x1, y1, x2, y2)
+            except Exception:
+                bounds = None
+
+        if bounds and screen_w > 0 and screen_h > 0:
+            x1, y1, x2, y2 = bounds
+            node_w = x2 - x1
+            node_h = y2 - y1
+            area_ratio = (node_w * node_h) / float(screen_w * screen_h)
+            width_ratio = node_w / float(screen_w)
+            height_ratio = node_h / float(screen_h)
+            if area_ratio >= 0.90 or (width_ratio >= 0.98 and height_ratio >= 0.98):
+                continue
+
+        rid = str(node.attrib.get("resource-id", "") or "").strip()
+        has_rid = bool(rid) and rid not in {"android:id/content"}
+        has_text = bool(str(node.attrib.get("text", "") or "").strip())
+        has_desc = bool(str(node.attrib.get("content-desc", "") or "").strip())
+        clickable = str(node.attrib.get("clickable", "false")).lower() == "true"
+
+        if has_text or has_desc or has_rid or clickable:
+            count += 1
+
+    return count
 
 
 @dataclass
@@ -939,7 +998,7 @@ class WorkflowRunner:
                 cur_sig = snap["state_sig"]
                 # We can't safely attribute this relocation to a precise UI edge.
                 # 这种“位置变更”通常不是由一个明确的业务动作引起，所以按 external move 方式修正栈结构。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=True)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=True)
                 # 对修复后的新页面重新安排分析任务。
                 self._schedule_state(cur_sig, snap, task)
                 # 本轮剩余逻辑作废，直接开始下一轮。
@@ -1015,7 +1074,7 @@ class WorkflowRunner:
                 # 清空强制重规划标记，避免后续重复消费。
                 self._clear_forced_replan()
                 # 把当前栈位置修正到新状态；如果已经有边，就不再补 observation。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=not has_edge)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=not has_edge)
                 # 为新页面重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 直接进入下一轮。
@@ -1063,7 +1122,7 @@ class WorkflowRunner:
                 # 同步更新当前状态签名。
                 cur_sig = snap["state_sig"]
                 # overlay 关闭后的状态通常不适合直接沿用旧栈，需要做一次外部移动式修正。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                 # 对新页面重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 本轮结束，开始下一轮。
@@ -1082,7 +1141,7 @@ class WorkflowRunner:
                 # 更新当前 sig。
                 cur_sig = snap["state_sig"]
                 # 修正 DFS 栈，使其与真实当前位置一致。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                 # 重新安排后续分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 当前轮结束。
@@ -1160,7 +1219,7 @@ class WorkflowRunner:
                 # 清除该标记。
                 self._clear_forced_replan()
                 # 根据是否已有边来修正当前位置与 DFS 栈。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=not has_edge)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=not has_edge)
                 # 对当前位置重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 结束当前轮。
@@ -1212,7 +1271,7 @@ class WorkflowRunner:
                 # 更新当前状态签名。
                 cur_sig = snap["state_sig"]
                 # 对“通过 beam 跳转后的位置”修正 DFS 栈。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                 # 为新页面重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 当前轮结束。
@@ -1248,7 +1307,7 @@ class WorkflowRunner:
                         # 更新当前 sig。
                         cur_sig = snap["state_sig"]
                         # 修正 DFS 栈与当前位置。
-                        self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                        self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                         # 重新安排分析。
                         self._schedule_state(cur_sig, snap, task)
                         # 当前轮结束。
@@ -1273,7 +1332,7 @@ class WorkflowRunner:
                         # 更新当前 sig。
                         cur_sig = snap["state_sig"]
                         # 修正当前位置在 DFS 栈中的表达。
-                        self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                        self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                         # 对新页面重新安排分析。
                         self._schedule_state(cur_sig, snap, task)
                         # 本轮结束。
@@ -1306,7 +1365,7 @@ class WorkflowRunner:
                     # 更新当前 sig。
                     cur_sig = snap["state_sig"]
                     # 修正当前位置与 DFS 栈。
-                    self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                    self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                     # 重新安排分析。
                     self._schedule_state(cur_sig, snap, task)
                 else:
@@ -1347,7 +1406,7 @@ class WorkflowRunner:
                 # 更新当前 sig。
                 cur_sig = snap["state_sig"]
                 # 修正 DFS 栈。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                 # 为当前位置重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 本轮结束。
@@ -1367,7 +1426,7 @@ class WorkflowRunner:
                 # 更新 sig。
                 cur_sig = snap["state_sig"]
                 # 修正 DFS 栈。
-                self._reconcile_stack_on_external_move(cur_sig, record_observation=False)
+                self._reconcile_stack_on_external_move(cur_sig, snap=snap, record_observation=False)
                 # 重新安排分析。
                 self._schedule_state(cur_sig, snap, task)
                 # 本轮结束。
@@ -1893,7 +1952,7 @@ class WorkflowRunner:
                     self.snapshot_cache.popitem(last=False)
                 self._log_event("snapshot_cache_miss", sig=sig, raw_key=raw_key, cache_size=len(self.snapshot_cache))
 
-            xml_reliable = bool(xml and ("<node" in xml or "<hierarchy" in xml) and len(xml) >= 400)
+            xml_reliable = count_meaningful_xml_nodes(xml) >= int(self.budget.meaningful_xml_nodes_threshold)
             coarse_sig = compute_coarse_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             struct_sig = compute_structural_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             fine_sig = compute_fine_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
@@ -2098,7 +2157,7 @@ class WorkflowRunner:
                 self._log_event("snapshot_cache_miss", sig=sig, raw_key=raw_key, cache_size=len(self.snapshot_cache))
 
             screenshot_phash = compute_screenshot_phash(screenshot_b64)
-            xml_reliable = bool(xml and ("<node" in xml or "<hierarchy" in xml) and len(xml) >= 400)
+            xml_reliable = count_meaningful_xml_nodes(xml) >= int(self.budget.meaningful_xml_nodes_threshold)
             coarse_sig = compute_coarse_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             struct_sig = compute_structural_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             fine_sig = compute_fine_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
@@ -2353,7 +2412,7 @@ class WorkflowRunner:
             pass
 
         try:
-            if xml_reliable and exp_xml_hash:
+            if xml_reliable and exp_xml_hash:# xml 可信且有历史 hash，优先用 XML 判断变化（大多数 app 都是这个情况）
                 xml_now = self.appium.page_source_once()
                 if not xml_now:
                     return self._capture_and_process(timeout=timeout_s)
@@ -2362,7 +2421,7 @@ class WorkflowRunner:
                 cur = hashlib.md5((xml_now or "").encode("utf-8")).hexdigest()
                 if cur == exp_xml_hash:
                     return None
-            elif exp_shot_hash:
+            elif exp_shot_hash:# XML 不可信但有历史截图 hash，先判断截图hash是否相同(完全相同界面),在判断Phash是否相似(处理动态界面).
                 png_now = self.appium.screenshot_png_once()
                 if not png_now:
                     return self._capture_and_process(timeout=timeout_s)
@@ -2746,7 +2805,7 @@ class WorkflowRunner:
             self.dfs_stack.append(to_sig)
             self.dfs_via.append(str(via_action or ""))
 
-    def _reconcile_stack_on_external_move(self, cur_sig: str, *, record_observation: bool = True) -> None:
+    def _reconcile_stack_on_external_move(self, cur_sig: str, snap: Optional[Dict[str, Any]] = None, *, record_observation: bool = True) -> None:
         """
         IPO:
           in : cur_sig after recovery/restart/overlay resolution
@@ -2922,6 +2981,7 @@ class WorkflowRunner:
             logger.debug("NAV cooldown active for sig=%s", sig[:8])
             self._log_event("nav_cooldown", sig=sig, cooldown_until=self.nav_cooldown_until.get(sig))
 
+        # Old topic-route logic kept here for comparison during the router migration.
         # Topic routing (LLM2-1): UI-only, cached by state_sig.
         open_gaps = self.questionnaires.open_gaps()
         if open_gaps and sig not in self.topic_route_cache and sig not in self._topic_route_futures:
@@ -2938,10 +2998,50 @@ class WorkflowRunner:
                 },
             )
             self._topic_route_futures[sig] = self._pool.submit(self.gpt.propose_topic_routes, topics, signals, sig)
-
+            
         # Topic fill (LLM2-2): topic-scoped, scheduled only when router says relevant and topic has open gaps.
         if sig in self.topic_route_cache:
             self._schedule_topic_fills(sig, snap)
+
+
+
+
+        # New router-only LLM2-1 draft:
+        # - Ask only router questions from the current questionnaire execution view.
+        # - The program will later map router answers -> active blocks locally.
+        # - This stays disabled for now because the downstream future/cache/drain
+        #   pipeline still expects TopicRouteResult rather than RouterResult.
+        #
+        # open_gaps = self.questionnaires.open_gaps()
+        # router_questions_fn = getattr(self.questionnaires, "router_questions_shallow", None)
+        # if (
+        #     open_gaps
+        #     and callable(router_questions_fn)
+        #     and sig not in self.topic_route_cache
+        #     and sig not in self._topic_route_futures
+        # ):
+        #     router_questions = router_questions_fn(max_questions=40)
+        #     if router_questions:
+        #         self._topic_route_enqueue_ts[sig] = time.time()
+        #         self._emit_llm_enqueued(
+        #             "router_fill",
+        #             sig,
+        #             {
+        #                 "state_sig": sig,
+        #                 "router_question_count": len(router_questions),
+        #                 "enqueue_ts": self._topic_route_enqueue_ts[sig],
+        #             },
+        #         )
+        #         self._topic_route_futures[sig] = self._pool.submit(
+        #             self.gpt.propose_router_answers,
+        #             snap["screenshot"],
+        #             router_questions,
+        #             sig,
+        #         )
+        #
+        # # Later migration target:
+        # # if sig in self.router_answer_cache:
+        # #     self._schedule_block_fills(sig, snap)
 
 
     def _schedule_topic_fills(self, sig: str, snap: Dict[str, Any]) -> None:
@@ -4820,48 +4920,66 @@ class WorkflowRunner:
                 return best
             return None
 
+        # 把候选列表整理成 {候选稳定key -> 候选对象} 的映射，后面按 key 查 candidate 会更方便。
         cand_map = {self._candidate_key(c): c for c in pool if getattr(c, "actions", None)}
+        # 当前找到的最优 forward 候选，初始化为空。
         best = None
+        # 当前最优分数，先给一个很小的初值，保证第一个合法候选能覆盖它。
         best_score = -1e9
+        # 记录最优候选的打分细节，方便调试“为什么选了它”。
         best_detail: Optional[Dict[str, Any]] = None
+        # 取当前活跃 topic 的上下文，用来给“更贴近当前问卷主题”的页面加分。
         _, topic_blob = self._active_topic_context()
 
         for ckey, dst_sig in outcomes.items():
+            # 如果这个候选已经在当前页被标记为 explored，就不再重复提交。
             if ckey in explored:
                 continue
+            # 如果这个候选当前处于黑名单中，也先跳过。
             if self._is_action_blacklisted(src_sig, ckey):
                 continue
+            # 通过 key 找回对应的候选对象；如果候选池里已经没有它，就没法继续算分。
             cand = cand_map.get(ckey)
             if not cand:
                 continue
 
+            # probe 结果如果显示“目标页还是当前页”，说明这个候选基本没带来前进价值，跳过。
             if dst_sig == src_sig:
                 continue
 
+            # 如果目标页已经被识别成 dismiss / loading 这类 overlay，就不把它当作正式 forward 目标。
             dst_nav = self.nav_cache.get(dst_sig)
             if dst_nav and self._overlay_kind_value(dst_nav) in (OverlayKind.DISMISS.value, OverlayKind.LOADING.value):
                 continue
 
-            # Skip committing to a child already exhausted
+            # 如果目标子页面本身已经 exhausted（没有可继续探索的价值），就不要再 commit 过去。
             if self._is_state_exhausted(dst_sig):
                 continue
 
+            # 看 probe 阶段是否把这个候选对应的目标页判成“新状态”。
             is_new_at_probe = self.probe_novelty.get(self._family_id(src_sig), {}).get(ckey, False)
 
+            # 新页面奖励更高；不是全新页面也给一个较小的基础分，避免所有旧页面一票否决。
             novelty_score = 10.0 if is_new_at_probe else 2.0
+            # 总分从 novelty 分起步。
             score = novelty_score
 
+            # 如果目标页已经产出了问卷更新，就把“问卷收益”计入分数。
             upd = self.q_cache.get(dst_sig)
             q_yield = 0.0
             if upd:
+                # proposed_updates 越多，说明这个页面越可能对填问卷有帮助；这里封顶到 8 分。
                 q_yield = min(8.0, 1.4 * float(len(getattr(upd, "proposed_updates", []) or [])))
                 score += q_yield
 
+            # 目标页和当前活跃 topic 越匹配，越加分。
             topic_score = self._topic_match_score(dst_sig, topic_blob)
+            # 某些 UI 类型（例如更像主流程页面）会有额外 bonus。
             ui_type_bonus = self._ui_type_bonus(dst_sig)
             score += topic_score
             score += ui_type_bonus
 
+            # 访问次数少的页面更值得去，避免总在老页面之间绕圈。
             node = self.graph.get_node(dst_sig)
             visit_score = 0.0
             if node:
@@ -4869,6 +4987,7 @@ class WorkflowRunner:
                 visit_score = 3.0 / max(1.0, visits)
                 score += visit_score
 
+            # 尽量找出当前页面在 DFS 路径里的父节点是谁，后面用来识别“这个候选是不是明显在往回走”。
             parent = None
             try:
                 if src_sig in self.dfs_stack:
@@ -4880,21 +4999,28 @@ class WorkflowRunner:
                 parent = self.parent_map.get(src_sig)
             back_penalty = 0.0
             if parent and dst_sig == parent:
-                # discourage committing to obvious "go back"; DFS backtrace handles explicit back
+                # 如果目标页正好就是父节点，说明这个 forward 很像“往回退”，这里做一个惩罚。
+                # 明确的回退由 DFS backtrace 去处理，不希望 forward 阶段浪费在明显后退上。
                 back_penalty = -2.0
                 score += back_penalty
 
+            # LLM1 给候选自带的 score 也会参与总分，但只是综合因素中的一项。
             cand_score = float(getattr(cand, "score", 0.0) or 0.0)
+            # 把候选原始分乘上权重，得到它对总分的贡献。
             cand_score_term = self.budget.cand_score_weight * cand_score
             score += cand_score_term
 
+            # 这个候选在当前页/当前 family 下尝试次数越多，重复惩罚越大。
             attempts = int(self.action_attempt_counts.get((self._family_id(src_sig), ckey), 0) or 0)
+            # 用 log1p 做惩罚，让第一次、第二次重复更敏感，后面增长逐渐变缓。
             repeat_pen = float(self.budget.repeat_penalty_alpha) * float(math.log1p(max(0, attempts)))
             score -= repeat_pen
 
+            # 维护一个“当前分数最高的候选”。
             if score > best_score:
                 best_score = score
                 best = cand
+                # 把每个组成部分都记下来，便于后面输出 explain / trace。
                 best_detail = {
                     "action_key": ckey,
                     "dst_sig": dst_sig,
@@ -4911,22 +5037,28 @@ class WorkflowRunner:
                     "attempts": attempts,
                 }
 
+        # 保存这次 forward 选择的细节，供日志/调试查看。
         self._last_forward_detail = best_detail
         if best is not None:
             return best
 
-        # Break-glass: if all options were filtered (e.g., blacklisted), allow scoring anyway.
+        # Break-glass:
+        # 如果前面的严格过滤把所有候选都筛掉了（例如全被 blacklist/exhausted 过滤掉），
+        # 那就退回一个更保守的兜底策略：只按 candidate 自带分数再选一次。
         if outcomes:
             self._log_event("blacklist_break_glass", sig=src_sig, kind="forward_selection")
             best = None
             best_score = -1e9
             best_detail = None
             for ckey, dst_sig in outcomes.items():
+                # explored 的仍然不考虑，避免明显重复。
                 if ckey in explored:
                     continue
                 cand = cand_map.get(ckey)
+                # 没 candidate 或根本没离开当前页的，兜底也不选。
                 if not cand or dst_sig == src_sig:
                     continue
+                # 兜底模式下不再用复杂因素，只看 LLM 原始 candidate 分数。
                 cand_score = float(getattr(cand, "score", 0.0) or 0.0)
                 score = self.budget.cand_score_weight * cand_score
                 if score > best_score:
