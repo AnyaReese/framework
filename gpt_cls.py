@@ -767,14 +767,28 @@ class GPTClient:
         self.client = None
         try:
             import openai  # type: ignore
+            import httpx
+
+            proxy_url = (
+                os.getenv("HTTPS_PROXY")
+                or os.getenv("https_proxy")
+                or os.getenv("HTTP_PROXY")
+                or os.getenv("http_proxy")
+            )
+            http_client = httpx.Client(proxy=proxy_url) if proxy_url else None
 
             if hasattr(openai, "OpenAI"):
-                self.client = openai.OpenAI(api_key=self.api_key)
+                kwargs = {"api_key": self.api_key}
+                if http_client is not None:
+                    kwargs["http_client"] = http_client
+                self.client = openai.OpenAI(**kwargs)
             elif hasattr(openai, "Client"):
                 self.client = openai.Client(api_key=self.api_key) if self.api_key else openai.Client()
             else:
                 self.client = openai
-        except Exception:
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("OpenAI client init failed: %s", e)
             self.client = None
 
     @time_consumed
