@@ -1,37 +1,61 @@
 """
 questionnaire_state2.py
 
-Minimal experimental state layer for the new router/block workflow.
+Small execution-state helper for the new UI-level router/block workflow.
 
-Current scope:
-1. Read generated `questionnaire_routers.json`.
-2. Read generated `questionnaire_blocks.json`.
-3. Keep only three runtime structures:
-   - `routers`: all router questions
-   - `blocks`: all blocks, preserving each block's internal local structure
-   - `block_status`: runtime state for each block
+This file intentionally keeps only three public runtime structures:
+1. `routers`
+   A flat list of router questions loaded from `questionnaire_routers.json`.
+2. `blocks`
+   A flat list of blocks loaded from `questionnaire_blocks.json`.
+   Each block contains its own `questions` dict, so the block still preserves
+   the implicit question tree through each question's internal `show_if`.
+3. `block_status`
+   Runtime counters keyed by block id.
 
-Design note:
-- The "topic" here means a short human-readable summary for a block.
-- It is NOT the old tree topic id.
-- For now `topic` is initialized to "" and will be filled later by another step.
+The main workflow is not wired to this file yet. The purpose of this layer is
+to make router-answer -> matched-block debugging simple and inspectable first.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class QuestionnaireState:
     """
-    Minimal execution-view state.
+    Minimal state container for the UI-level split questionnaire.
 
-    Public structures after loading:
-    - self.routers: List[dict]
-    - self.blocks: List[dict]
-    - self.block_status: Dict[block_id, dict]
+    Public fields after loading:
+    - routers:
+      List[dict]. Each item is one router question:
+      {
+        "id": "sexuality_includes",
+        "full_id": "sexuality.sexuality_includes",
+        "module": "sexuality",
+        "category": "multiple_class",
+        "question": "...",
+        "type": "multiple",
+        "options": [...],
+        "show_if": ...
+      }
+    - blocks:
+      List[dict]. Each item is one fillable block:
+      {
+        "id": "sexuality.sexuality_includes.suggestive...",
+        "module": "sexuality",
+        "topic": "",
+        "block_show_if": [{"id": "sexuality_includes", "option_id": "..."}],
+        "questions": {"question_id": {...UI-level question payload...}}
+      }
+    - block_status:
+      Dict[block_id, dict]. Runtime counters only:
+      {
+        "<block_id>": {"topic": "", "visit_count": 0, "hit_count": 0}
+      }
     """
 
     def __init__(self) -> None:
@@ -42,13 +66,20 @@ class QuestionnaireState:
     @staticmethod
     def load_from_questionnaire_dir(questionnaire_dir: str) -> "QuestionnaireState":
         """
-        Load router/block data by passing the original questionnaire directory,
-        for example:
-        - questionnaire-v2/games
-        - questionnaire-v2/social_apps
-        - questionnaire-v2/others
+        Load generated split files by passing the original questionnaire dir.
 
-        The matching generated split directory is inferred automatically.
+        Input:
+        - questionnaire_dir:
+          Original questionnaire collection path, e.g. `questionnaire-v2/games`.
+
+        Processing:
+        - Infer the generated split folder from the collection name:
+          `mytest2/questionnaire_handler/chain_debug/<collection>_split`.
+        - Delegate to `load_routers_and_blocks(...)`.
+
+        Output:
+        - QuestionnaireState
+          A loaded instance with `routers`, `blocks`, and `block_status`.
         """
         qdir = Path(questionnaire_dir).resolve()
         collection_name = qdir.name
@@ -61,114 +92,286 @@ class QuestionnaireState:
 
     def load_routers_and_blocks(self, split_dir: str) -> None:
         """
-        Read and normalize:
-        - questionnaire_routers.json
-        - questionnaire_blocks.json
+        Read generated router/block JSON files.
 
-        Output is stored into:
-        - self.routers
-        - self.blocks
-        - self.block_status
+        Input:
+        - split_dir:
+          Directory containing:
+          - questionnaire_routers.json
+          - questionnaire_blocks.json
+
+        Processing:
+        - Read `{"routers": [...]}` into `self.routers`.
+        - Read `{"blocks": [...]}` into `self.blocks`.
+        - Initialize `self.block_status` with zero counters for every block.
+
+        Output:
+        - None. The instance fields are updated in-place.
         """
         root = Path(split_dir).resolve()
         routers_path = root / "questionnaire_routers.json"
         blocks_path = root / "questionnaire_blocks.json"
 
-        self.routers = []
-        self.blocks = []
-        self.block_status = {}
-
-        if routers_path.exists():
-            self.routers = self._read_routers_json(routers_path)
-
-        if blocks_path.exists():
-            self.blocks = self._read_blocks_json(blocks_path)
-
+        self.routers = self._read_routers_json(routers_path) if routers_path.exists() else []
+        self.blocks = self._read_blocks_json(blocks_path) if blocks_path.exists() else []
         self._init_block_status()
+
+    def match_blocks_from_router_answers(self, router_answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Return all blocks whose `block_show_if` conditions are satisfied.
+
+        Input:
+        - router_answers:
+          List of LLM2-1 router answers. Each item should look like:
+          {
+            "question_id": "sexuality.sexuality_includes",
+            "new_answer": ["nudity_or_revealing_outfits"]
+          }
+          `question_id` may also be local, e.g. `sexuality_includes`.
+
+        Processing:
+        - Build an answer lookup using both full ids and local ids.
+        - A block with empty `block_show_if` is always matched.
+        - A block with conditions is matched only when every condition's
+          option_id appears in the corresponding router answer.
+
+        Output:
+        - List[dict]
+          Full block payloads from `self.blocks`.
+        """
+        answer_lookup = self._normalize_router_answers(router_answers)
+        matched: List[Dict[str, Any]] = []
+
+        for block in self.blocks:
+            conditions = list(block.get("block_show_if") or [])
+            if not conditions:
+                matched.append(block)
+                continue
+            if all(self._condition_is_satisfied(cond, answer_lookup) for cond in conditions):
+                matched.append(block)
+        return matched
+
+    def mark_blocks_hit(self, matched_blocks: List[Dict[str, Any]]) -> None:
+        """
+        Increment hit counters for blocks selected by router answers.
+
+        Input:
+        - matched_blocks:
+          Usually the output of `match_blocks_from_router_answers(...)`.
+
+        Processing:
+        - For each block, read `block["id"]`.
+        - Increase `block_status[id]["hit_count"]`.
+
+        Output:
+        - None. `block_status` is updated in-place.
+        """
+        for block in matched_blocks:
+            block_id = str(block.get("id") or "").strip()
+            if block_id in self.block_status:
+                self.block_status[block_id]["hit_count"] += 1
+
+    def mark_blocks_visited(self, block_ids: List[str]) -> None:
+        """
+        Increment visit counters for blocks actually sent to LLM2-2.
+
+        Input:
+        - block_ids:
+          List of block ids, usually pulled from matched blocks.
+
+        Processing:
+        - Increase `visit_count` for each known block id.
+
+        Output:
+        - None. `block_status` is updated in-place.
+        """
+        for raw_id in block_ids:
+            block_id = str(raw_id or "").strip()
+            if block_id in self.block_status:
+                self.block_status[block_id]["visit_count"] += 1
+
+    def get_block_payload(self, block_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch one complete block payload by id.
+
+        Input:
+        - block_id:
+          The block id from `questionnaire_blocks.json`.
+
+        Processing:
+        - Scan `self.blocks` and return the block with matching `id`.
+
+        Output:
+        - dict if found, otherwise None.
+        """
+        target = str(block_id or "").strip()
+        for block in self.blocks:
+            if str(block.get("id") or "").strip() == target:
+                return block
+        return None
+
+    def save_observation(
+        self,
+        out_dir: str,
+        state_sig: str,
+        router_answers: List[Dict[str, Any]],
+        matched_blocks: List[Dict[str, Any]],
+        block_fill_results: List[Dict[str, Any]],
+        screenshot_path: str = "",
+    ) -> Path:
+        """
+        Persist one UI observation for later inspection/merge.
+
+        Input:
+        - out_dir:
+          Directory where the observation JSON will be saved.
+        - state_sig:
+          Current UI state signature.
+        - router_answers:
+          Raw LLM2-1 answers.
+        - matched_blocks:
+          Blocks selected locally from router answers.
+        - block_fill_results:
+          LLM2-2 results for visited blocks. This can be empty during state
+          debugging.
+        - screenshot_path:
+          Optional path to the screenshot used for this observation.
+
+        Processing:
+        - Store compact ids plus raw answers/results.
+        - File name includes timestamp and state_sig for easy browsing.
+
+        Output:
+        - Path to the written JSON file.
+        """
+        root = Path(out_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        safe_sig = str(state_sig or "unknown").replace("/", "_").replace("\\", "_")
+        out_path = root / f"{stamp}_{safe_sig}.json"
+
+        payload = {
+            "state_sig": state_sig,
+            "screenshot_path": screenshot_path,
+            "router_answers": router_answers,
+            "matched_block_ids": [block.get("id") for block in matched_blocks],
+            "block_fill_results": block_fill_results,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out_path
 
     def _read_routers_json(self, path: Path) -> List[Dict[str, Any]]:
         """
-        Normalize all router questions into one flat list.
+        Read `questionnaire_routers.json`.
 
-        Each router item keeps only the fields we currently care about.
+        Input:
+        - path: JSON file with shape `{"routers": [...]}`.
+
+        Output:
+        - List[dict]. The router objects are kept as generated.
         """
         data = self._read_json(path)
-        routers: List[Dict[str, Any]] = []
-
-        for namespace, payload in (data or {}).items():
-            for raw in payload.get("router_questions", []) or []:
-                question_id = str(raw.get("question_id") or "")
-                routers.append(
-                    {
-                        "namespace": namespace,
-                        "question_id": question_id,
-                        "question_full_id": f"{namespace}.{question_id}",
-                        "router_name": str(raw.get("router_name") or f"{namespace}.{question_id}"),
-                        "question": str(raw.get("question") or ""),
-                        "type": str(raw.get("type") or "single").lower(),
-                        "options": list(raw.get("options") or []),
-                    }
-                )
-
-        return routers
+        return list(data.get("routers") or [])
 
     def _read_blocks_json(self, path: Path) -> List[Dict[str, Any]]:
         """
-        Normalize all blocks into one flat list.
+        Read `questionnaire_blocks.json`.
 
-        Important:
-        - The OUTER container is a list for easy traversal/debugging.
-        - Each block itself still preserves its LOCAL tree structure via:
-          - question_ids / question_full_ids
-          - questions
-          - edges
-          - parent_split_node
-          - split_trigger
-          - router_path
+        Input:
+        - path: JSON file with shape `{"blocks": [...]}`.
+
+        Output:
+        - List[dict]. The block objects are kept as generated.
         """
         data = self._read_json(path)
-        blocks: List[Dict[str, Any]] = []
-
-        for namespace, payload in (data or {}).items():
-            for raw in payload.get("blocks", []) or []:
-                question_ids = [str(x) for x in (raw.get("question_ids") or [])]
-                question_full_ids = [f"{namespace}.{qid}" for qid in question_ids]
-
-                blocks.append(
-                    {
-                        "namespace": namespace,
-                        "block_id": str(raw.get("block_id") or ""),
-                        "block_name": str(raw.get("block_name") or raw.get("block_id") or ""),
-                        "topic": "",
-                        "entry_kind": str(raw.get("entry_kind") or ""),
-                        "entry_label": str(raw.get("entry_label") or ""),
-                        "parent_split_node": raw.get("parent_split_node"),
-                        "split_trigger": raw.get("split_trigger"),
-                        "router_path": list(raw.get("router_path") or []),
-                        "question_ids": question_ids,
-                        "question_full_ids": question_full_ids,
-                        "questions": list(raw.get("questions") or []),
-                        "edges": list(raw.get("edges") or []),
-                    }
-                )
-
-        return blocks
+        return list(data.get("blocks") or [])
 
     def _init_block_status(self) -> None:
         """
-        Initialize runtime status for every block right after loading.
+        Initialize runtime counters for all loaded blocks.
+
+        Input:
+        - self.blocks:
+          The generated block catalog.
+
+        Processing:
+        - Use each block's `id` as the key.
+        - Copy `topic` so later topic-generation can populate it without
+          changing the counter schema.
+
+        Output:
+        - None. `self.block_status` becomes:
+          {block_id: {"topic": "", "visit_count": 0, "hit_count": 0}}
         """
         self.block_status = {}
-
         for block in self.blocks:
-            block_id = str(block.get("block_id") or "")
+            block_id = str(block.get("id") or "").strip()
+            if not block_id:
+                continue
             self.block_status[block_id] = {
-                "block_id": block_id,
-                "block_name": str(block.get("block_name") or ""),
                 "topic": str(block.get("topic") or ""),
                 "visit_count": 0,
                 "hit_count": 0,
             }
+
+    def _normalize_router_answers(self, router_answers: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Build a router-answer lookup using both local and full ids.
+
+        Input:
+        - router_answers:
+          Items from `RouterResult.router_updates`.
+
+        Processing:
+        - If answer id is `module.question`, also add `question`.
+        - If answer id is local, add local id and, when possible, the matching
+          full id from `self.routers`.
+
+        Output:
+        - Dict[str, Any] where keys may include both `id` and `full_id`.
+        """
+        lookup: Dict[str, Any] = {}
+        local_to_full = {
+            str(router.get("id") or ""): str(router.get("full_id") or "")
+            for router in self.routers
+            if router.get("id") and router.get("full_id")
+        }
+
+        for item in router_answers:
+            raw_qid = str(item.get("question_id") or "").strip()
+            if not raw_qid:
+                continue
+            answer = item.get("new_answer")
+            lookup[raw_qid] = answer
+
+            if "." in raw_qid:
+                local = raw_qid.rsplit(".", 1)[-1]
+                lookup[local] = answer
+            elif raw_qid in local_to_full:
+                lookup[local_to_full[raw_qid]] = answer
+        return lookup
+
+    def _condition_is_satisfied(self, condition: Dict[str, Any], answer_lookup: Dict[str, Any]) -> bool:
+        """
+        Check one `block_show_if` condition against normalized answers.
+
+        Input:
+        - condition:
+          {"id": "sexuality_includes", "option_id": "nudity_or_revealing_outfits"}
+        - answer_lookup:
+          Output of `_normalize_router_answers(...)`.
+
+        Output:
+        - bool. True when the router answer includes the required option.
+        """
+        question_id = str(condition.get("id") or "").strip()
+        option_id = str(condition.get("option_id") or "").strip()
+        if not question_id or not option_id or question_id not in answer_lookup:
+            return False
+
+        answer = answer_lookup.get(question_id)
+        values = answer if isinstance(answer, list) else ([] if answer is None else [answer])
+        return option_id in {str(value) for value in values}
 
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:

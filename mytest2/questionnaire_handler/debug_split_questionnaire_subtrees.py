@@ -18,6 +18,17 @@ debug_split_questionnaire_subtrees.py
 - 目前 games 模块的拆分规则主要维护在这里。
 """
 
+# Purpose:
+# - Split the original questionnaire tree into UI-level router questions and
+#   fillable blocks.
+# - Use `questionnaire-v2` only for tree/split structure.
+# - Use `mytest2/questionnaire_handler/questionnaire_UI_level` as the runtime
+#   question source for category/question/type/options/show_if fields.
+# Outputs:
+# - questionnaire_split_subtrees.json
+# - questionnaire_routers.json
+# - questionnaire_blocks.json
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_QUESTIONNAIRE_ROOT = PROJECT_ROOT / "questionnaire-v2"
 DEFAULT_QUESTIONNAIRE_DIR = DEFAULT_QUESTIONNAIRE_ROOT / "games"
+DEFAULT_UI_QUESTIONNAIRE_ROOT = PROJECT_ROOT / "mytest2" / "questionnaire_handler" / "questionnaire_UI_level"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "mytest2" / "questionnaire_handler" / "chain_debug"
 
 
@@ -128,6 +140,15 @@ def parse_args() -> argparse.Namespace:
         help="Base directory to write debug JSON outputs.",
     )
     parser.add_argument(
+        "--ui-questionnaire-root",
+        type=Path,
+        default=DEFAULT_UI_QUESTIONNAIRE_ROOT,
+        help=(
+            "Root directory of the UI-level questionnaire files. "
+            "Generated routers/blocks copy question text/options/category from here."
+        ),
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Process all configured questionnaire collections (games/social_apps/others). Default when --questionnaire-dir is omitted.",
@@ -138,6 +159,101 @@ def parse_args() -> argparse.Namespace:
 def _load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _load_ui_questionnaires(ui_root: Path, collection_name: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load the UI-level questionnaire files for one collection.
+
+    Input:
+    - ui_root: root folder containing `games/`, `social_apps/`, and `others/`.
+    - collection_name: the collection being split, for example `games`.
+
+    Processing:
+    - Read every `*.json` file under `<ui_root>/<collection_name>`.
+    - Use the filename stem as the module name.
+
+    Output:
+    - Dict[module, Dict[question_id, question_payload]]
+      The question payload is kept in the UI-level format.
+    """
+    collection_dir = ui_root / collection_name
+    ui_docs: Dict[str, Dict[str, Any]] = {}
+    if not collection_dir.exists():
+        raise FileNotFoundError(f"UI-level questionnaire directory not found: {collection_dir}")
+
+    for path in sorted(collection_dir.glob("*.json")):
+        data = _load_json(path)
+        if isinstance(data, dict):
+            ui_docs[path.stem] = data
+    return ui_docs
+
+
+def _strip_question_for_execution(question: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Copy one UI-level question and remove fields that are not needed at runtime.
+
+    Input:
+    - question: one question dict from `questionnaire_UI_level`.
+
+    Processing:
+    - Deep-copy the question so later cleanup never mutates the source file.
+    - Drop `learn_more`, because the user decided it should not be kept in
+      generated router/block payloads.
+
+    Output:
+    - Dict[str, Any]
+      A question dict still shaped like the UI-level source schema.
+    """
+    out = copy.deepcopy(question)
+    out.pop("learn_more", None)
+    for opt in out.get("options") or []:
+        if isinstance(opt, dict):
+            opt.pop("learn_more", None)
+    return out
+
+
+def _ui_question(ui_docs: Dict[str, Dict[str, Any]], module: str, question_id: str) -> Dict[str, Any]:
+    """
+    Fetch one UI-level question by module and id.
+
+    Input:
+    - ui_docs: output of `_load_ui_questionnaires(...)`.
+    - module: questionnaire module/file stem, e.g. `violence`.
+    - question_id: local question id inside that module.
+
+    Output:
+    - Dict[str, Any]
+      The UI-level question payload with `learn_more` removed.
+
+    Raises:
+    - KeyError if the split result references a question missing from the
+      UI-level questionnaire. This is intentional; it catches schema drift early.
+    """
+    if module not in ui_docs:
+        raise KeyError(f"UI-level module missing: {module}")
+    if question_id not in ui_docs[module]:
+        raise KeyError(f"UI-level question missing: {module}.{question_id}")
+    return _strip_question_for_execution(ui_docs[module][question_id])
+
+
+def _ui_question_optional(ui_docs: Dict[str, Dict[str, Any]], module: str, question_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort version of `_ui_question(...)` for old-tree compatibility.
+
+    Input:
+    - ui_docs/module/question_id: same as `_ui_question(...)`.
+
+    Processing:
+    - Return None when the UI-level questionnaire intentionally removed a
+      question that still exists in the original tree.
+
+    Output:
+    - Question dict or None.
+    """
+    if module not in ui_docs or question_id not in ui_docs[module]:
+        return None
+    return _strip_question_for_execution(ui_docs[module][question_id])
 
 
 def _option_lookup(node: Dict[str, Any]) -> Dict[str, str]:
@@ -693,10 +809,32 @@ def _build_sexuality_payload(payload: Dict[str, Any], path: Path, doc: Dict[str,
     )
 
 
-def build_payload(questionnaire_dir: Path) -> Dict[str, Any]:
+def build_payload(questionnaire_dir: Path, ui_questionnaire_root: Path = DEFAULT_UI_QUESTIONNAIRE_ROOT) -> Dict[str, Any]:
+    """
+    Build the split debug payload for one questionnaire collection.
+
+    Input:
+    - questionnaire_dir:
+      Original tree questionnaire directory. We still use it only for the
+      structural split rules because it contains explicit child edges.
+    - ui_questionnaire_root:
+      Root of the UI-level questionnaire. Router/block question text, options,
+      category, and show_if are copied from here.
+
+    Processing:
+    1. Split original trees into intermediate subtree specs.
+    2. Load UI-level questions for the same collection.
+    3. Export routers and blocks in the new UI-level execution schema.
+
+    Output:
+    - Dict[str, Any]
+      Full debug payload containing summary, intermediate namespace payloads,
+      and final `routers` / `blocks` files.
+    """
     namespaces: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
     collection_name = questionnaire_dir.name
+    ui_docs = _load_ui_questionnaires(ui_questionnaire_root, collection_name)
 
     for path in sorted(questionnaire_dir.glob("*.json")):
         doc = _load_json(path)
@@ -721,52 +859,230 @@ def build_payload(questionnaire_dir: Path) -> Dict[str, Any]:
 
     return {
         "questionnaire_dir": str(questionnaire_dir),
+        "ui_questionnaire_root": str(ui_questionnaire_root),
         "questionnaire_collection": collection_name,
         "split_config": SPLIT_CONFIG.get(collection_name, {}),
         "deferred_namespaces": DEFERRED_NAMESPACES,
         "summary": summary_rows,
         "namespaces": namespaces,
-        "routers": _collect_routers(namespaces),
-        "blocks": _collect_blocks(namespaces),
+        "routers": _collect_routers(namespaces, ui_docs),
+        "blocks": _collect_blocks(namespaces, ui_docs),
     }
 
 
-def _collect_routers(namespaces: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for ns in namespaces:
-        namespace = str(ns.get("namespace") or "")
-        out[namespace] = {
-            "namespace": namespace,
-            "router_questions": ns.get("router_questions") or [],
-            "router_edges": ns.get("router_edges") or [],
-        }
-    return out
+def _collect_routers(namespaces: List[Dict[str, Any]], ui_docs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Export router questions in the new flat UI-level schema.
 
+    Input:
+    - namespaces: intermediate split payloads.
+    - ui_docs: UI-level question lookup.
 
-def _collect_blocks(namespaces: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+    Processing:
+    - For every split/router question, copy the UI-level question payload.
+    - Add stable routing metadata:
+      - id: local question id
+      - full_id: module.id
+      - module: original questionnaire module/file name
+
+    Output:
+    - {"routers": [router_question, ...]}
+    """
+    routers: List[Dict[str, Any]] = []
     for ns in namespaces:
-        namespace = str(ns.get("namespace") or "")
-        blocks: List[Dict[str, Any]] = []
-        for block in (ns.get("subtrees") or []):
-            question_ids = block.get("question_ids") or []
-            blocks.append(
+        module = str(ns.get("namespace") or "")
+        for raw in (ns.get("router_questions") or []):
+            question_id = str(raw.get("question_id") or "").strip()
+            if not question_id:
+                continue
+            q = _ui_question_optional(ui_docs, module, question_id)
+            if q is None:
+                continue
+            routers.append(
                 {
-                    "block_id": block.get("subtree_id"),
-                    "block_name": block.get("block_name"),
-                    "entry_kind": block.get("entry_kind"),
-                    "entry_label": block.get("entry_label"),
-                    "parent_split_node": block.get("parent_split_node"),
-                    "split_trigger": block.get("split_trigger"),
-                    "router_path": block.get("router_path") or [],
-                    "question_ids": question_ids,
-                    "question_full_ids": [f"{namespace}.{qid}" for qid in question_ids],
-                    "questions": block.get("questions") or [],
-                    "edges": block.get("edges") or [],
+                    "id": question_id,
+                    "full_id": f"{module}.{question_id}",
+                    "module": module,
+                    **q,
                 }
             )
-        out[namespace] = {"namespace": namespace, "blocks": blocks}
+    return {"routers": routers}
+
+
+def _resolve_ui_option_id(
+    ui_docs: Dict[str, Dict[str, Any]],
+    module: str,
+    question_id: str,
+    option_id: str,
+    option_value: str = "",
+) -> str:
+    """
+    Resolve an old-tree option id to the UI-level option id.
+
+    Input:
+    - ui_docs/module/question_id: locate the UI-level router question.
+    - option_id: option id from the original tree.
+    - option_value: optional value text from the original tree trigger.
+
+    Processing:
+    - Prefer exact id match.
+    - Then try exact option value match.
+    - Then try unique prefix match because some original-tree ids are
+      truncated while UI-level ids are longer.
+
+    Output:
+    - str. The UI-level option id when found, otherwise the original option_id.
+    """
+    raw_id = str(option_id or "").strip()
+    raw_value = str(option_value or "").strip().lower()
+    question = ui_docs.get(module, {}).get(question_id) or {}
+    options = [opt for opt in (question.get("options") or []) if isinstance(opt, dict)]
+    ids = [str(opt.get("id") or "").strip() for opt in options]
+
+    if raw_id in ids:
+        return raw_id
+
+    if raw_value:
+        for opt in options:
+            if str(opt.get("value") or "").strip().lower() == raw_value:
+                return str(opt.get("id") or "").strip()
+
+    prefix_matches = [oid for oid in ids if oid.startswith(raw_id) or raw_id.startswith(oid)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+
+    return raw_id
+
+
+def _router_path_to_block_show_if(
+    block: Dict[str, Any],
+    ui_docs: Dict[str, Dict[str, Any]],
+    module: str,
+) -> List[Dict[str, str]]:
+    """
+    Convert old split metadata into the new block-level trigger list.
+
+    Input:
+    - block: one intermediate subtree dict. It may contain:
+      - router_path: upstream router dependencies
+      - parent_split_node + split_trigger: this block's direct trigger
+
+    Processing:
+    - Preserve every router_path item that already has a concrete
+      `trigger_option_id`.
+    - Add the direct parent split trigger as `{id, option_id}`.
+    - Deduplicate while preserving order.
+
+    Output:
+    - List[{"id": router_question_id, "option_id": selected_option_id}]
+      Empty list means this block is always eligible.
+    """
+    out: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+
+    def add(question_id: str, option_id: str, option_value: str = "") -> None:
+        qid = str(question_id or "").strip()
+        oid = _resolve_ui_option_id(ui_docs, module, qid, str(option_id or ""), str(option_value or ""))
+        if not qid or not oid:
+            return
+        key = (qid, oid)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"id": qid, "option_id": oid})
+
+    for step in (block.get("router_path") or []):
+        add(str(step.get("question_id") or ""), str(step.get("trigger_option_id") or ""))
+
+    split_trigger = block.get("split_trigger") or {}
+    parent_split_node = str(block.get("parent_split_node") or "")
+    add(
+        parent_split_node,
+        str(split_trigger.get("option_id") or split_trigger.get("answer_id") or ""),
+        str(split_trigger.get("option_value") or split_trigger.get("answer_value") or ""),
+    )
     return out
+
+
+def _question_dict_for_block(
+    *,
+    ui_docs: Dict[str, Dict[str, Any]],
+    module: str,
+    question_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build the `questions` dict for one block.
+
+    Input:
+    - ui_docs: UI-level question lookup.
+    - module: questionnaire module/file stem.
+    - question_ids: question ids assigned to this block by the split step.
+
+    Processing:
+    - Copy each UI-level question as-is except `learn_more`.
+    - Keep internal show_if dependencies when the parent question is also in
+      this block.
+    - Remove external show_if dependencies because those are represented by
+      the block's `block_show_if`; this prevents LLM2-2 from seeing a question
+      gated by an absent router question.
+
+    Output:
+    - Dict[question_id, question_payload]
+    """
+    in_block = {str(qid) for qid in question_ids}
+    questions: Dict[str, Dict[str, Any]] = {}
+    for qid in question_ids:
+        clean = _ui_question_optional(ui_docs, module, str(qid))
+        if clean is None:
+            continue
+        show_if = clean.get("show_if")
+        if isinstance(show_if, dict):
+            parent_id = str(show_if.get("id") or "")
+            if parent_id and parent_id not in in_block:
+                clean["show_if"] = None
+        questions[str(qid)] = clean
+    return questions
+
+
+def _collect_blocks(namespaces: List[Dict[str, Any]], ui_docs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Export blocks in the new flat UI-level execution schema.
+
+    Input:
+    - namespaces: intermediate split payloads.
+    - ui_docs: UI-level question lookup.
+
+    Output:
+    - {"blocks": [block, ...]}
+      Each block has:
+      - id
+      - module
+      - topic
+      - block_show_if
+      - questions
+    """
+    blocks: List[Dict[str, Any]] = []
+    for ns in namespaces:
+        module = str(ns.get("namespace") or "")
+        for block in (ns.get("subtrees") or []):
+            question_ids = [str(qid) for qid in (block.get("question_ids") or [])]
+            questions = _question_dict_for_block(
+                ui_docs=ui_docs,
+                module=module,
+                question_ids=question_ids,
+            )
+            if not questions:
+                continue
+            blocks.append(
+                {
+                    "id": str(block.get("block_name") or block.get("subtree_id") or ""),
+                    "module": module,
+                    "topic": "",
+                    "block_show_if": _router_path_to_block_show_if(block, ui_docs, module),
+                    "questions": questions,
+                }
+            )
+    return {"blocks": blocks}
 
 
 def _print_payload(payload: Dict[str, Any]) -> None:
@@ -800,7 +1116,7 @@ def _write_payload_files(payload: Dict[str, Any], out_dir: Path) -> None:
 def main() -> int:
     args = parse_args()
     if args.questionnaire_dir is not None:
-        payload = build_payload(args.questionnaire_dir)
+        payload = build_payload(args.questionnaire_dir, args.ui_questionnaire_root)
         _print_payload(payload)
         _write_payload_files(payload, args.out_dir)
         return 0
@@ -808,7 +1124,7 @@ def main() -> int:
     collection_names = list(SPLIT_CONFIG.keys())
     for collection_name in collection_names:
         questionnaire_dir = DEFAULT_QUESTIONNAIRE_ROOT / collection_name
-        payload = build_payload(questionnaire_dir)
+        payload = build_payload(questionnaire_dir, args.ui_questionnaire_root)
         print(f"\n=== collection: {collection_name} ===")
         _print_payload(payload)
         _write_payload_files(payload, args.out_dir / f"{collection_name}_split")

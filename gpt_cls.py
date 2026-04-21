@@ -461,12 +461,22 @@ GOAL:
 
 INPUTS:
 - state_sig: UI signature for staleness/debug
-- router_questions: router question entries {question_id,router_name?,question,type,options}
+- router_questions: router question entries:
+  {
+    id,
+    full_id,
+    module,
+    category,
+    question,
+    type,
+    options,
+    show_if?
+  }
 - screenshot: the current UI screenshot; this is the primary evidence source
 
 OUTPUT (strict JSON matching RouterResult):
 - router_updates: 0..12 router answers, each with:
-  - question_id (must exist in router_questions)
+  - question_id (prefer full_id from router_questions; local id is acceptable only if full_id is absent)
   - new_answer
   - confidence
   - rationale(<=1 sentence)
@@ -475,6 +485,9 @@ RULES:
 - Prefer precision over recall. If unsure, omit.
 - Do not invent question_ids.
 - If the current screen does not contain enough evidence for a router question, skip that question and do not include it in router_updates.
+- Router questions are provided as a flat list. Treat `show_if` only as background context, not as an availability gate.
+- For multiple-choice routers, `new_answer` should be a list of option ids.
+- For single-choice routers, `new_answer` should be one option id string.
 """
 
 
@@ -499,6 +512,52 @@ OUTPUT (strict JSON matching QuestionnaireUpdate):
 - proposed_updates: only include items you can justify from this screen.
 - For single-select questions: new_answer should be ONE option id/value (string).
 - For multi-select questions: new_answer should be a list of option ids/values.
+"""
+
+
+_BLOCK_FILL_SYSTEM = """You are LLM2-2 (Block Filler) for an Android UI exploration agent.
+
+GOAL:
+- Propose questionnaire updates ONLY for the provided block payload.
+- Use ONLY evidence present on the current screen (screenshot + block questions).
+- Skip any question that does not have enough visible evidence on this screen.
+
+INPUTS:
+- state_sig: UI signature for staleness/debug
+- block_payload:
+  {
+    id,
+    module,
+    topic,
+    block_show_if,
+    questions: {
+      question_id: {
+        category,
+        question,
+        type,
+        options,
+        show_if
+      }
+    }
+  }
+- screenshot: current UI screenshot; this is the primary evidence source
+
+OUTPUT (strict JSON matching QuestionnaireUpdate):
+- proposed_updates: only include updates justified by this screen.
+- For single-select questions: new_answer should be ONE option id/value string.
+- For multi-select questions: new_answer should be a list of option ids/values.
+
+RULES:
+- Do not answer questions outside the given block.
+- Prefer precision over recall. If unsure, omit.
+- Never answer "No" only because evidence is absent.
+- Use question ids from `block_payload.questions` as `question_id` in proposed_updates.
+- Category hints for future merge:
+  - mutual: options are different meanings; answer only the visibly supported option.
+  - severity: options imply severity; answer the visibly supported severity.
+  - frequency: answer only when the screenshot clearly supports a frequency/yes-no observation.
+  - multiple_class: select all visibly supported classes.
+  - multiple_freq: select all visibly supported frequency-tracked options.
 """
 
 
@@ -701,7 +760,10 @@ class GPTClient:
 
         Inputs:
         - screenshot_b64: current screen screenshot, primary evidence source
-        - router_questions: executable router questions extracted from questionnaire_routers.json
+        - router_questions:
+          Executable router questions extracted from `questionnaire_routers.json`.
+          Each router keeps the UI-level question shape plus:
+          `id`, `full_id`, and `module`.
         - state_sig: current page state signature
 
         Output:
@@ -727,6 +789,60 @@ class GPTClient:
         out = self._call_structured(messages, RouterResult, opname="propose_router_answers")
         out.router_updates = list(out.router_updates or [])[:12]
         out.state_sig = state_sig or out.state_sig
+        return out
+
+    @time_consumed
+    def propose_block_fill(
+        self,
+        screenshot_b64: str,
+        block_payload: Dict[str, Any],
+        state_sig: str = "",
+    ) -> QuestionnaireUpdate:
+        """
+        Fill one matched questionnaire block using the current screenshot.
+
+        Inputs:
+        - screenshot_b64:
+          Base64-encoded screenshot for the current UI. This is the primary evidence source.
+        - block_payload:
+          The full payload of one block from `questionnaire_blocks.json`.
+          Expected keys include:
+          - id
+          - module
+          - topic
+          - block_show_if
+          - questions
+        - state_sig:
+          Current UI state signature for debugging/staleness.
+
+        Processing:
+        - Build a compact payload containing only this block and state_sig.
+        - Send the payload and screenshot to the structured LLM call.
+        - Trim the returned updates to a safe small size.
+
+        Output:
+        - QuestionnaireUpdate
+          The `proposed_updates` field represents this block's answer candidates
+          on the current screen.
+        """
+        payload = {
+            "state_sig": state_sig,
+            "block_payload": block_payload,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _BLOCK_FILL_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, QuestionnaireUpdate, opname="propose_block_fill")
+        out.proposed_updates = list(out.proposed_updates or [])[:24]
         return out
 
     @time_consumed
