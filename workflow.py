@@ -52,6 +52,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from collections import OrderedDict, deque
 
@@ -64,15 +65,17 @@ from gpt_cls import (
     ActionCandidate,
     ActionStep,
     ActionType,
+    BlocksFillResult,
     GPTClient,
     NavigationProposal,
     OverlayKind,
     QuestionnaireUpdate,
     RecoveryProposal,
+    RouterResult,
     TopicRouteResult,
     UIView,
 )
-from questionnaire_state import QuestionnaireState
+from questionnaire_state2 import QuestionnaireState as QuestionnaireState2
 from state_graph import StateGraph
 from ui_cls import BaseUI
 from trace_callbacks import Callbacks, StepCtx, NoOpCallbacks
@@ -476,7 +479,7 @@ def count_meaningful_xml_nodes(xml_text: str) -> int:
 class WorkflowRunner:
     appium: AndroidAppiumClient
     gpt: GPTClient
-    questionnaires: QuestionnaireState
+    questionnaires: QuestionnaireState2
     budget: BudgetConfig = field(default_factory=BudgetConfig)
 
     target_package: str = ""
@@ -498,17 +501,24 @@ class WorkflowRunner:
     _nav_futures: Dict[str, Future] = field(default_factory=dict, init=False)
     _topic_route_futures: Dict[str, Future] = field(default_factory=dict, init=False)
     _topic_fill_futures: Dict[Tuple[str, str, str], Future] = field(default_factory=dict, init=False)
+    _block_router_futures: Dict[str, Future] = field(default_factory=dict, init=False)
+    _blocks_fill_futures: Dict[str, Future] = field(default_factory=dict, init=False)
 
     # LLM caches keyed by state_sig
     nav_cache: Dict[str, NavigationProposal] = field(default_factory=dict, init=False)
     topic_route_cache: Dict[str, TopicRouteResult] = field(default_factory=dict, init=False)
     q_cache: Dict[str, QuestionnaireUpdate] = field(default_factory=dict, init=False)
     topic_fill_cache: Dict[Tuple[str, str, str], QuestionnaireUpdate] = field(default_factory=dict, init=False)
+    block_router_cache: Dict[str, RouterResult] = field(default_factory=dict, init=False)
+    block_match_cache: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict, init=False)
+    blocks_fill_cache: Dict[str, BlocksFillResult] = field(default_factory=dict, init=False)
 
     # LLM enqueue timestamps
     _nav_enqueue_ts: Dict[str, float] = field(default_factory=dict, init=False)
     _topic_route_enqueue_ts: Dict[str, float] = field(default_factory=dict, init=False)
     _topic_fill_enqueue_ts: Dict[Tuple[str, str, str], float] = field(default_factory=dict, init=False)
+    _block_router_enqueue_ts: Dict[str, float] = field(default_factory=dict, init=False)
+    _blocks_fill_enqueue_ts: Dict[str, float] = field(default_factory=dict, init=False)
 
     # Topic fill attempt tracking (cooldown per (sig,topic_id))
     topic_fill_attempt_ts: Dict[Tuple[str, str], float] = field(default_factory=dict, init=False)
@@ -646,6 +656,14 @@ class WorkflowRunner:
                 "com.google.android.googlequicksearchbox",
             }
         )
+        try:
+            logger.info(
+                "QuestionnaireState2 active: routers=%d blocks=%d",
+                len(getattr(self.questionnaires, "routers", []) or []),
+                len(getattr(self.questionnaires, "blocks", []) or []),
+            )
+        except Exception:
+            logger.debug("QuestionnaireState2 summary failed", exc_info=True)
 
     # ---------------------------
     # Trace helpers
@@ -654,21 +672,18 @@ class WorkflowRunner:
     def _mk_ctx(self, cur_sig: str) -> StepCtx:
         self._step_seq += 1
         try:
-            gaps = list(self.questionnaires.open_gaps())
+            block_status = copy.deepcopy(getattr(self.questionnaires, "block_status", {}) or {})
         except Exception:
-            gaps = []
-        try:
-            answered = float(self.questionnaires.progress_score())
-        except Exception:
-            answered = 0.0
+            block_status = {}
         return StepCtx(
             run_id=self.run_id,
             step_id=self._step_seq,
             ts=time.time(),
             cur_sig=cur_sig,
             stack=list(self.dfs_stack),
-            open_gaps=gaps,
-            answered_ratio=answered,
+            block_status=block_status,
+            open_gaps=[],
+            answered_ratio=0.0,
         )
 
     def _emit_snapshot(self, snap: Dict[str, Any]) -> None:
@@ -713,6 +728,74 @@ class WorkflowRunner:
             self.callbacks.on_decision(self._mk_ctx(sig), name, detail)
         except Exception:
             logger.debug("on_decision failed", exc_info=True)
+
+    def _questionnaire2_observation_dir(self) -> Path:
+        """
+        Return where the new router/block observations should be saved.
+
+        Input:
+        - No explicit input. Uses callback/run metadata already attached to
+          the workflow runner.
+
+        Processing:
+        - If JsonlTraceCallbacks is active, write beside the trace under:
+          `<trace_run_root>/questionnaire2_observations`.
+        - Otherwise write to a stable debug folder under `mytest2`.
+
+        Output:
+        - Path to an observation directory. The directory is created by
+          `QuestionnaireState2.save_observation(...)`.
+        """
+        cb_root = str(getattr(self.callbacks, "root_dir", "") or "").strip()
+        if cb_root:
+            return Path(cb_root) / "questionnaire2_observations"
+        run_token = self.run_id or time.strftime("%Y%m%d_%H%M%S")
+        return Path("mytest2") / "questionnaire_handler" / "chain_debug" / "workflow_questionnaire2_observations" / run_token
+
+    def _save_questionnaire2_observation(
+        self,
+        sig: str,
+        router_answers: List[Dict[str, Any]],
+        matched_blocks: List[Dict[str, Any]],
+        block_fill_results: Optional[List[Dict[str, Any]]] = None,
+        *,
+        stage: str = "blocks_fill",
+        screenshot_path: str = "",
+    ) -> Optional[Path]:
+        """
+        Persist one observation produced by the new router/block path.
+
+        Input:
+        - sig: current state signature.
+        - router_answers: LLM2-1 router answers, already converted to dicts.
+        - matched_blocks: full block payloads matched locally by block_show_if.
+        - block_fill_results: optional LLM2-2 results grouped by block.
+        - stage: subfolder name, e.g. "router" or "blocks_fill".
+        - screenshot_path: optional path to the screenshot asset.
+
+        Processing:
+        - Delegate JSON writing to QuestionnaireState2.save_observation.
+        - Save router answers, matched block ids, and any block fill results
+          available for this state.
+
+        Output:
+        - Path if saved, otherwise None.
+        """
+        q2 = self.questionnaires
+        if q2 is None or not hasattr(q2, "save_observation"):
+            return None
+        try:
+            return q2.save_observation(
+                out_dir=str(self._questionnaire2_observation_dir() / stage),
+                state_sig=sig,
+                router_answers=router_answers,
+                matched_blocks=matched_blocks,
+                block_fill_results=list(block_fill_results or []),
+                screenshot_path=screenshot_path,
+            )
+        except Exception:
+            logger.debug("QuestionnaireState2 observation save failed sig=%s", sig[:8], exc_info=True)
+            return None
 
     # ---------------------------
     # Structured log helpers
@@ -961,27 +1044,23 @@ class WorkflowRunner:
             self._drain_futures()
 
             # 读取当前仍未填完的问卷问题，作为主循环的目标集合。
-            gaps = self.questionnaires.open_gaps()
+            block_status = getattr(self.questionnaires, "block_status", {}) or {}
             # 计算当前问卷完成比例，用于日志和调试观察整体推进情况。
-            answered_ratio = self.questionnaires.progress_score()
-
             # 打印当前循环的核心状态，包括页面 sig、栈深、动作数、剩余 gap、异步任务数量等。
             logger.info(
-                "Loop: sig=%s stack_depth=%d actions=%d gaps=%d answered=%.2f pending(nav=%d route=%d fill=%d) no_progress=%d no_new=%d",
+                "Loop: sig=%s stack_depth=%d actions=%d blocks=%d pending(nav=%d block_router=%d) no_progress=%d no_new=%d",
                 cur_sig[:8],
                 len(self.dfs_stack),
                 self.action_count,
-                len(gaps),
-                answered_ratio,
+                len(block_status),
                 len(self._nav_futures),
-                len(self._topic_route_futures),
-                len(self._topic_fill_futures),
+                len(self._block_router_futures),
                 self.no_progress_loops,
                 self.no_new_state_count,
             )
 
             # 如果已经没有未完成问卷项，说明本次探索目标达成，可以结束。
-            if not gaps:
+            if False and block_status:
                 # 记录“所有 gap 都填完”的结束原因。
                 logger.info("All questionnaire gaps filled. Stopping.")
                 # 跳出主循环。
@@ -2951,18 +3030,16 @@ class WorkflowRunner:
         # NAV scheduling (LLM1)
         if now >= self.nav_cooldown_until.get(sig, 0.0):
             if sig not in self.nav_cache and sig not in self._nav_futures:
-                gaps = list(self.questionnaires.open_gaps())
-                active_topics = self.questionnaires.active_topics_top(limit=6)
-                logger.debug("Schedule NAV for sig=%s gaps=%d topics=%d", sig[:8], len(gaps), len(active_topics))
+                block_status = copy.deepcopy(getattr(self.questionnaires, "block_status", {}) or {})
+                logger.debug("Schedule NAV for sig=%s blocks=%d", sig[:8], len(block_status))
                 self._nav_enqueue_ts[sig] = time.time()
-                self._log_event("nav_scheduled", sig=sig, gaps=len(gaps), topics=len(active_topics), enqueue_ts=self._nav_enqueue_ts[sig])
+                self._log_event("nav_scheduled", sig=sig, blocks=len(block_status), enqueue_ts=self._nav_enqueue_ts[sig])
                 self._emit_llm_enqueued(
                     "nav",
                     sig,
                     {
                         "state_sig": sig,
-                        "open_gaps_count": len(gaps),
-                        "active_topics": active_topics,
+                        "block_status": block_status,
                         "task": task,
                         "history": list(self.history),
                         "enqueue_ts": self._nav_enqueue_ts[sig],
@@ -2972,7 +3049,7 @@ class WorkflowRunner:
                     self.gpt.propose_navigation,
                     snap["screenshot"],
                     snap["uist"],
-                    active_topics,
+                    block_status,
                     task,
                     list(self.history),
                     sig,
@@ -2981,70 +3058,60 @@ class WorkflowRunner:
             logger.debug("NAV cooldown active for sig=%s", sig[:8])
             self._log_event("nav_cooldown", sig=sig, cooldown_until=self.nav_cooldown_until.get(sig))
 
-        # Old topic-route logic kept here for comparison during the router migration.
-        # Topic routing (LLM2-1): UI-only, cached by state_sig.
-        open_gaps = self.questionnaires.open_gaps()
-        if open_gaps and sig not in self.topic_route_cache and sig not in self._topic_route_futures:
-            topics = self.questionnaires.topic_tree_shallow(max_topics=60)
-            signals = self._page_signals(sig, snap, nav=self.nav_cache.get(sig))
-            self._topic_route_enqueue_ts[sig] = time.time()
-            self._emit_llm_enqueued(
-                "topic_route",
-                sig,
-                {
-                    "state_sig": sig,
-                    "topic_count": len(topics),
-                    "enqueue_ts": self._topic_route_enqueue_ts[sig],
-                },
-            )
-            self._topic_route_futures[sig] = self._pool.submit(self.gpt.propose_topic_routes, topics, signals, sig)
-            
-        # Topic fill (LLM2-2): topic-scoped, scheduled only when router says relevant and topic has open gaps.
-        if sig in self.topic_route_cache:
-            self._schedule_topic_fills(sig, snap)
+        # Old topic_route/topic_fill are disabled in the block_status workflow.
 
-
-
-
-        # New router-only LLM2-1 draft:
-        # - Ask only router questions from the current questionnaire execution view.
-        # - The program will later map router answers -> active blocks locally.
-        # - This stays disabled for now because the downstream future/cache/drain
-        #   pipeline still expects TopicRouteResult rather than RouterResult.
-        #
-        # open_gaps = self.questionnaires.open_gaps()
-        # router_questions_fn = getattr(self.questionnaires, "router_questions_shallow", None)
-        # if (
-        #     open_gaps
-        #     and callable(router_questions_fn)
-        #     and sig not in self.topic_route_cache
-        #     and sig not in self._topic_route_futures
-        # ):
-        #     router_questions = router_questions_fn(max_questions=40)
-        #     if router_questions:
-        #         self._topic_route_enqueue_ts[sig] = time.time()
-        #         self._emit_llm_enqueued(
-        #             "router_fill",
-        #             sig,
-        #             {
-        #                 "state_sig": sig,
-        #                 "router_question_count": len(router_questions),
-        #                 "enqueue_ts": self._topic_route_enqueue_ts[sig],
-        #             },
-        #         )
-        #         self._topic_route_futures[sig] = self._pool.submit(
-        #             self.gpt.propose_router_answers,
-        #             snap["screenshot"],
-        #             router_questions,
-        #             sig,
-        #         )
-        #
-        # # Later migration target:
-        # # if sig in self.router_answer_cache:
-        # #     self._schedule_block_fills(sig, snap)
+        # New UI-level router/block path, observation mode only.
+        # Input:
+        # - current screenshot
+        # - flat router list from QuestionnaireState2
+        # Processing:
+        # - LLM2-1 answers router questions
+        # - local code maps router answers to matched blocks
+        # Output:
+        # - an observation JSON saved by `_drain_futures`.
+        q2 = self.questionnaires
+        if (
+            sig not in self.block_router_cache
+            and sig not in self.block_match_cache
+            and sig not in self._block_router_futures
+        ):
+            router_questions = list(getattr(q2, "routers", []) or [])
+            if router_questions:
+                self._block_router_enqueue_ts[sig] = time.time()
+                self._emit_llm_enqueued(
+                    "block_router",
+                    sig,
+                    {
+                        "state_sig": sig,
+                        "router_question_count": len(router_questions),
+                        "enqueue_ts": self._block_router_enqueue_ts[sig],
+                    },
+                )
+                self._block_router_futures[sig] = self._pool.submit(
+                    self.gpt.propose_router_answers,
+                    snap.get("screenshot", ""),
+                    router_questions,
+                    sig,
+                )
+            else:
+                try:
+                    matched_blocks = q2.match_blocks_from_router_answers([])
+                    q2.mark_blocks_hit(matched_blocks)
+                    self.block_match_cache[sig] = matched_blocks
+                    obs_path = self._save_questionnaire2_observation(sig, [], matched_blocks, stage="router")
+                    self._log_event(
+                        "block_router_no_routers",
+                        sig=sig,
+                        matched_block_count=len(matched_blocks),
+                        observation_path=str(obs_path or ""),
+                    )
+                except Exception:
+                    logger.debug("QuestionnaireState2 no-router matching failed sig=%s", sig[:8], exc_info=True)
 
 
     def _schedule_topic_fills(self, sig: str, snap: Dict[str, Any]) -> None:
+        # Disabled: old topic_fill is not used by the block_status workflow.
+        return
         if not self._pool:
             return
         route = self.topic_route_cache.get(sig)
@@ -3106,6 +3173,53 @@ class WorkflowRunner:
                 signals,
                 sig,
             )
+
+    def _schedule_blocks_fill(self, sig: str, snap: Dict[str, Any], matched_blocks: List[Dict[str, Any]]) -> None:
+        """
+        Schedule one LLM2-2 call for all blocks matched on the current UI.
+
+        Input:
+        - sig: current state signature.
+        - snap: authoritative snapshot containing screenshot.
+        - matched_blocks: full block payloads from QuestionnaireState2.
+
+        Processing:
+        - Skip if there are no matched blocks or a fill is already cached/in-flight.
+        - Mark matched block ids as visited because they are being sent to LLM2-2.
+        - Submit one `propose_blocks_fill` future with all matched blocks.
+
+        Output:
+        - None. Future state is stored in `_blocks_fill_futures`.
+        """
+        if not self._pool or not matched_blocks:
+            return
+        if sig in self.blocks_fill_cache or sig in self._blocks_fill_futures:
+            return
+
+        block_ids = [str(block.get("id") or "") for block in matched_blocks if block.get("id")]
+        try:
+            self.questionnaires.mark_blocks_visited(block_ids)
+        except Exception:
+            logger.debug("mark_blocks_visited failed sig=%s", sig[:8], exc_info=True)
+
+        now = time.time()
+        self._blocks_fill_enqueue_ts[sig] = now
+        self._emit_llm_enqueued(
+            "blocks_fill",
+            sig,
+            {
+                "state_sig": sig,
+                "block_count": len(matched_blocks),
+                "block_ids": block_ids,
+                "enqueue_ts": now,
+            },
+        )
+        self._blocks_fill_futures[sig] = self._pool.submit(
+            self.gpt.propose_blocks_fill,
+            snap.get("screenshot", ""),
+            matched_blocks,
+            sig,
+        )
 
     def _drain_futures(self) -> None:
         """
@@ -3190,6 +3304,127 @@ class WorkflowRunner:
                     )
                 finally:
                     self._nav_futures.pop(sig, None)
+
+        for sig in list(self._block_router_futures.keys()):
+            fut = self._block_router_futures[sig]
+            if fut.done():
+                try:
+                    route: RouterResult = fut.result()
+                    if getattr(route, "state_sig", sig) and route.state_sig != sig:
+                        self._log_event("block_router_reject", sig=sig, reason="stale_state_sig", got=route.state_sig)
+                    else:
+                        q2 = self.questionnaires
+                        router_answers = [
+                            item.model_dump(mode="json") if hasattr(item, "model_dump") else getattr(item, "__dict__", {})
+                            for item in (getattr(route, "router_updates", None) or [])
+                        ]
+                        matched_blocks: List[Dict[str, Any]] = []
+                        matched_blocks = q2.match_blocks_from_router_answers(router_answers)
+                        q2.mark_blocks_hit(matched_blocks)
+                        self.block_router_cache[sig] = route
+                        self.block_match_cache[sig] = matched_blocks
+
+                        obs_path = self._save_questionnaire2_observation(sig, router_answers, matched_blocks, stage="router")
+                        self._log_event(
+                            "block_router_ready",
+                            sig=sig,
+                            router_update_count=len(router_answers),
+                            matched_block_count=len(matched_blocks),
+                            observation_path=str(obs_path or ""),
+                        )
+                        snap = self.llm_snap_cache.get(sig)
+                        if snap and matched_blocks:
+                            self._schedule_blocks_fill(sig, snap, matched_blocks)
+
+                    start = self._block_router_enqueue_ts.pop(sig, None)
+                    result_payload = route.model_dump(mode="json") if hasattr(route, "model_dump") else getattr(route, "__dict__", {})
+                    self._emit_llm_result(
+                        "block_router",
+                        sig,
+                        {
+                            "state_sig": sig,
+                            "duration_s": (time.time() - start) if start else None,
+                            "matched_block_ids": [block.get("id") for block in self.block_match_cache.get(sig, [])],
+                            "result": result_payload,
+                        },
+                    )
+                except Exception:
+                    logger.debug("BlockRouter future failed sig=%s", sig[:8], exc_info=True)
+                    start = self._block_router_enqueue_ts.pop(sig, None)
+                    self._emit_llm_result(
+                        "block_router",
+                        sig,
+                        {
+                            "state_sig": sig,
+                            "duration_s": (time.time() - start) if start else None,
+                            "error": "block_router_future_failed",
+                        },
+                    )
+                finally:
+                    self._block_router_futures.pop(sig, None)
+
+        for sig in list(self._blocks_fill_futures.keys()):
+            fut = self._blocks_fill_futures[sig]
+            if fut.done():
+                try:
+                    result: BlocksFillResult = fut.result()
+                    self.blocks_fill_cache[sig] = result
+
+                    router_result = self.block_router_cache.get(sig)
+                    router_answers = [
+                        item.model_dump(mode="json") if hasattr(item, "model_dump") else getattr(item, "__dict__", {})
+                        for item in (getattr(router_result, "router_updates", None) or [])
+                    ] if router_result is not None else []
+                    matched_blocks = self.block_match_cache.get(sig, [])
+                    block_fill_results = [
+                        item.model_dump(mode="json") if hasattr(item, "model_dump") else getattr(item, "__dict__", {})
+                        for item in (getattr(result, "block_results", None) or [])
+                    ]
+                    obs_path = self._save_questionnaire2_observation(
+                        sig,
+                        router_answers,
+                        matched_blocks,
+                        block_fill_results=block_fill_results,
+                        stage="blocks_fill",
+                    )
+
+                    proposed_ct = sum(len(row.get("proposed_updates") or []) for row in block_fill_results)
+                    if proposed_ct:
+                        self.state_update_counts[sig] = int(self.state_update_counts.get(sig, 0) or 0) + int(proposed_ct)
+                        self._mark_progress("blocks_fill_observed", {"sig": sig, "proposed_count": proposed_ct})
+
+                    start = self._blocks_fill_enqueue_ts.pop(sig, None)
+                    self._log_event(
+                        "blocks_fill_ready",
+                        sig=sig,
+                        block_result_count=len(block_fill_results),
+                        proposed_count=proposed_ct,
+                        observation_path=str(obs_path or ""),
+                    )
+                    self._emit_llm_result(
+                        "blocks_fill",
+                        sig,
+                        {
+                            "state_sig": sig,
+                            "duration_s": (time.time() - start) if start else None,
+                            "observation_path": str(obs_path or ""),
+                            "result": result.model_dump(mode="json") if hasattr(result, "model_dump") else getattr(result, "__dict__", {}),
+                        },
+                    )
+                except Exception:
+                    logger.debug("BlocksFill future failed sig=%s", sig[:8], exc_info=True)
+                    start = self._blocks_fill_enqueue_ts.pop(sig, None)
+                    self._emit_llm_result(
+                        "blocks_fill",
+                        sig,
+                        {
+                            "state_sig": sig,
+                            "duration_s": (time.time() - start) if start else None,
+                            "error": "blocks_fill_future_failed",
+                        },
+                    )
+                finally:
+                    self._blocks_fill_futures.pop(sig, None)
 
         for sig in list(self._topic_route_futures.keys()):
             fut = self._topic_route_futures[sig]
@@ -4433,11 +4668,14 @@ class WorkflowRunner:
         return steps
 
     def _active_topic_context(self) -> Tuple[List[Dict[str, Any]], str]:
-        active_topics = self.questionnaires.active_topics_top(limit=6)
-        blob = " ".join(
-            [str(t.get("title") or "") + " " + " ".join([str(x) for x in (t.get("keywords") or [])]) for t in active_topics]
-        ).lower()
-        return active_topics, blob
+        """
+        Legacy beam helper kept for compatibility.
+
+        The block_status workflow no longer computes old active topics. Beam
+        scoring can still run, but questionnaire-specific score is neutral
+        until we design a block_status-aware frontier policy.
+        """
+        return [], ""
 
     def _topic_match_score(self, sig: str, topic_blob: str) -> float:
         score = 0.0
@@ -4451,18 +4689,6 @@ class WorkflowRunner:
                 if tag in topic_blob:
                     w = float(getattr(tg, "weight", 0.0) or 0.0)
                     score += 4.0 * max(0.2, min(1.0, w))
-
-        route = self.topic_route_cache.get(sig)
-        if route is not None:
-            best_conf = 0.0
-            for rt in (getattr(route, "relevant_topics", None) or [])[:8]:
-                tid = str(getattr(rt, "topic_id", "") or "").strip()
-                if not tid:
-                    continue
-                if not self.questionnaires.open_gaps_in_topic(tid):
-                    continue
-                best_conf = max(best_conf, float(getattr(rt, "confidence", 0.0) or 0.0))
-            score = max(score, 6.0 * best_conf)
 
         return float(min(10.0, score))
 
@@ -4555,7 +4781,7 @@ class WorkflowRunner:
         if self._is_state_exhausted(target_sig):
             return None
 
-        active_topics, topic_blob = self._active_topic_context()
+        questionnaire_context, topic_blob = self._active_topic_context()
 
         visits = float(getattr(node, "visit_count", 1) or 1) if node else 1.0
         novelty = 8.0 if visits <= 1 else 2.0
@@ -4616,7 +4842,7 @@ class WorkflowRunner:
             "edge_penalty": edge_penalty,
             "cost": cost,
             "score": score,
-            "active_topics": active_topics,
+            "questionnaire_context": questionnaire_context,
         }
         return score, detail
 
@@ -4624,7 +4850,7 @@ class WorkflowRunner:
         if not self.graph.nodes:
             return None
 
-        active_topics, topic_blob = self._active_topic_context()
+        questionnaire_context, topic_blob = self._active_topic_context()
 
         # 1) Build value-only candidates (cheap) then cost them for a small beam.
         candidates: List[Tuple[float, str, Dict[str, Any]]] = []
@@ -4724,7 +4950,7 @@ class WorkflowRunner:
                     "edge_penalty": edge_penalty,
                     "cost": cost,
                     "score": score,
-                    "active_topics": active_topics,
+                    "questionnaire_context": questionnaire_context,
                 }
 
         if not best_sig or best_detail is None:

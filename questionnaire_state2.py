@@ -20,6 +20,7 @@ to make router-answer -> matched-block debugging simple and inspectable first.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,9 +53,15 @@ class QuestionnaireState:
         "questions": {"question_id": {...UI-level question payload...}}
       }
     - block_status:
-      Dict[block_id, dict]. Runtime counters only:
+      Dict[block_id, dict]. Runtime counters and block metadata:
       {
-        "<block_id>": {"topic": "", "visit_count": 0, "hit_count": 0}
+        "<block_id>": {
+          "id": "...",
+          "module": "...",
+          "topic": "",
+          "visit_count": 0,
+          "hit_count": 0
+        }
       }
     """
 
@@ -247,7 +254,9 @@ class QuestionnaireState:
         root = Path(out_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time() * 1000)
-        safe_sig = str(state_sig or "unknown").replace("/", "_").replace("\\", "_")
+        # Windows treats ":" as an alternate-data-stream separator, so replace
+        # every filename-unsafe character, not only slashes.
+        safe_sig = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(state_sig or "unknown")).strip("_") or "unknown"
         out_path = root / f"{stamp}_{safe_sig}.json"
 
         payload = {
@@ -301,7 +310,7 @@ class QuestionnaireState:
 
         Output:
         - None. `self.block_status` becomes:
-          {block_id: {"topic": "", "visit_count": 0, "hit_count": 0}}
+          {block_id: {"id": ..., "module": ..., "topic": "", "visit_count": 0, "hit_count": 0}}
         """
         self.block_status = {}
         for block in self.blocks:
@@ -309,6 +318,8 @@ class QuestionnaireState:
             if not block_id:
                 continue
             self.block_status[block_id] = {
+                "id": block_id,
+                "module": str(block.get("module") or ""),
                 "topic": str(block.get("topic") or ""),
                 "visit_count": 0,
                 "hit_count": 0,

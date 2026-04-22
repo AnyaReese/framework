@@ -203,7 +203,7 @@ class NavigationProposal(BaseModel):
         ),
     )
 
-    why_these_actions: str = Field("", description="Brief rationale linking actions to active_topics (no hidden CoT)")
+    why_these_actions: str = Field("", description="Brief rationale linking actions to questionnaire evidence goals (no hidden CoT)")
 
 
 class RecoveryProposal(BaseModel):
@@ -246,6 +246,18 @@ class QuestionnaireUpdate(BaseModel):
         default_factory=list,
         description="Detected inconsistencies between current screen evidence and existing answers (string IDs).",
     )
+
+
+class BlockFillResult(BaseModel):
+    block_id: str = Field(..., description="Block id from questionnaire_blocks.json")
+    detected_signals: List[str] = Field(default_factory=list, description="Short evidence strings observed for this block")
+    proposed_updates: List[ProposedUpdate] = Field(default_factory=list, description="Question updates for this block only")
+    conflicts: List[str] = Field(default_factory=list, description="Optional conflict notes for this block")
+
+
+class BlocksFillResult(BaseModel):
+    state_sig: str = Field("", description="Echoed UI state signature")
+    block_results: List[BlockFillResult] = Field(default_factory=list, description="One result per answered block")
 
 
 class RelevantTopic(BaseModel):
@@ -355,13 +367,14 @@ def _compact_digest(ui_json: Dict[str, Any], limit: int = 220) -> Dict[str, Any]
 _NAV_SYSTEM = """You are LLM1 for an Android UI exploration agent.
 
 PRIMARY GOAL:
-- Explore the app to gather evidence and COMPLETE a fixed questionnaire efficiently.
-- Use active_topics as the high-level priorities (stable); do not expect full question lists.
+- Explore the app to gather evidence for a fixed questionnaire efficiently.
+- Use block_status as the questionnaire state signal. It tells you which questionnaire
+  blocks have been hit/visited so far; it is not a list of open questions.
 
 INPUTS:
 - state_sig: current UI signature (used to detect stale plans)
 - task: exploration goal string
-- active_topics: list of {topic_id,title,open_gaps,keywords?} (small and stable)
+- block_status: mapping of block_id -> {topic?, hit_count, visit_count, module?}
 - ui_digest: structured UI nodes with stable ids (YOU MUST reference these ids)
 - screenshot: actual rendered screen image
 - history: recent executed actions (context only)
@@ -393,7 +406,7 @@ REQUIRED OUTPUT (strict JSON matching NavigationProposal):
    - Each candidate should include 1-3 ordered actions (e.g., input then tap Confirm).
    - Provide a per-candidate \"score\" in [-1, 1] to express priority:
        * +1 strongly preferred, 0 neutral, -1 strongly deprioritized (e.g., go back).
-   - Each reasoning should mention which active_topics or tags the action may help.
+   - Each reasoning should mention which page evidence or block_status coverage signal the action may help.
 
 5) PROBE-RETURN POLICY (CRITICAL):
    - After a probe click, the agent may need to return to the original state to probe the next candidate.
@@ -406,7 +419,7 @@ REQUIRED OUTPUT (strict JSON matching NavigationProposal):
 6) DO NOT:
    - invent element_ids not in ui_digest
    - spam random clicks
-   - leave the app intentionally (external links) unless clearly needed for active_topics
+   - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
 """
 #prompt调整
 
@@ -561,6 +574,57 @@ RULES:
 """
 
 
+_BLOCKS_FILL_SYSTEM = """You are LLM2-2 (Blocks Filler) for an Android UI exploration agent.
+
+GOAL:
+- Fill the provided matched questionnaire blocks for the CURRENT screenshot.
+- Use ONLY visible evidence in this screenshot.
+- Skip questions that cannot be answered from the current screenshot.
+
+INPUTS:
+- state_sig: UI signature for debugging
+- blocks: list of block payloads:
+  {
+    id,
+    module,
+    topic,
+    block_show_if,
+    questions: {
+      question_id: {
+        category,
+        question,
+        type,
+        options,
+        show_if
+      }
+    }
+  }
+- screenshot: current UI screenshot
+
+OUTPUT (strict JSON matching BlocksFillResult):
+- block_results: one item per block that has answerable questions:
+  - block_id: must be one of the provided block ids
+  - detected_signals: short evidence strings
+  - proposed_updates: only questions inside that block
+  - conflicts: optional notes
+
+RULES:
+- Do not answer questions outside the provided blocks.
+- Use question ids exactly as keys in each block's `questions`.
+- For single-select questions: new_answer should be one option id string.
+- For multi-select questions: new_answer should be a list of option ids.
+- Prefer precision over recall. If unsure, omit.
+- Never answer "No" only because evidence is absent.
+- Respect internal question show_if: answer a child only when its parent answer is supported in the same block.
+- Category hints:
+  - mutual: choose the visible matching meaning.
+  - severity: choose the visible supported severity.
+  - frequency: answer only when the screenshot clearly supports the yes/frequency observation.
+  - multiple_class: select all visible classes.
+  - multiple_freq: select visible frequency-tracked options.
+"""
+
+
 _RECOVERY_SYSTEM = """You are LLM3 for recovery in Android UI automation.
 
 PRIMARY GOAL:
@@ -612,16 +676,33 @@ class GPTClient:
         self,
         screenshot_b64: str,
         ui_json: Dict[str, Any],
-        active_topics: List[Dict[str, Any]],
+        block_status: Dict[str, Any],
         task: str,
         history: Optional[List[str]] = None,
         state_sig: str = "",
     ) -> NavigationProposal:
+        """
+        Ask LLM1 to interpret the current UI and propose navigation actions.
+
+        Input:
+        - screenshot_b64: current UI screenshot.
+        - ui_json: compacted UI tree source.
+        - block_status: questionnaire block runtime status; this is the
+          navigation hint for questionnaire coverage.
+        - task/history/state_sig: exploration goal and recent context.
+
+        Processing:
+        - Build a small UI digest.
+        - Send block_status as questionnaire state context.
+
+        Output:
+        - NavigationProposal with overlay handling and candidate actions.
+        """
         ui_digest = _compact_digest(ui_json, limit=240)
         payload = {
             "state_sig": state_sig,
             "task": task,
-            "active_topics": active_topics[:8],
+            "block_status": block_status,
             "history": (history or [])[-12:],
             "ui_digest": ui_digest,
         }
@@ -843,6 +924,52 @@ class GPTClient:
 
         out = self._call_structured(messages, QuestionnaireUpdate, opname="propose_block_fill")
         out.proposed_updates = list(out.proposed_updates or [])[:24]
+        return out
+
+    @time_consumed
+    def propose_blocks_fill(
+        self,
+        screenshot_b64: str,
+        blocks_payload: List[Dict[str, Any]],
+        state_sig: str = "",
+    ) -> BlocksFillResult:
+        """
+        Fill all matched blocks for one UI state in a single LLM2-2 call.
+
+        Input:
+        - screenshot_b64: current UI screenshot.
+        - blocks_payload: matched block payloads from QuestionnaireState2.
+        - state_sig: current UI state signature.
+
+        Processing:
+        - Send the current screenshot and all matched blocks together.
+        - The model returns results grouped by block_id.
+
+        Output:
+        - BlocksFillResult. Each block result contains proposed question updates
+          for that block only.
+        """
+        payload = {
+            "state_sig": state_sig,
+            "blocks": blocks_payload,
+        }
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _BLOCKS_FILL_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": _b64_image_url(screenshot_b64)}} if screenshot_b64 else {"type": "text", "text": "(no screenshot)"},
+                ],
+            },
+        ]
+
+        out = self._call_structured(messages, BlocksFillResult, opname="propose_blocks_fill")
+        out.state_sig = state_sig or out.state_sig
+        out.block_results = list(out.block_results or [])[:20]
+        for block_result in out.block_results:
+            block_result.proposed_updates = list(block_result.proposed_updates or [])[:24]
         return out
 
     @time_consumed

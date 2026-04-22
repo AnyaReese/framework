@@ -10,7 +10,7 @@ import time
 
 from appium_android import AndroidAppiumClient
 from gpt_cls import GPTClient
-from questionnaire_state import QuestionnaireState
+from questionnaire_state2 import QuestionnaireState as QuestionnaireState2
 from workflow import BudgetConfig, WorkflowRunner
 from trace_callbacks import InteractiveDebugCallbacks, JsonlTraceCallbacks, NoOpCallbacks
 
@@ -139,7 +139,7 @@ sys.argv = [sys.argv[0],
             "--trace-dir", "./traces/",
             "--run-id", time.strftime("%Y%m%d_%H%M%S") + "_" + package,
             #"--pause",
-            "--interactive-debug",
+            # "--interactive-debug",
             "--disable-probe-return",
             "--min-candidate-score", "0.0",
             "--relaunch", "--debug"]
@@ -160,8 +160,16 @@ def main(argv=None):
         if not api_key:
             logging.getLogger(__name__).warning("OPENAI_API_KEY not set; GPT calls will fail.")
 
-        # Load questionnaire(s)
-        q = QuestionnaireState.load_from_dir(args.questionnaire_dir)
+        # Load the UI-level router/block questionnaire state.
+        # This replaces the old tree-state workflow; block_status is the main
+        # runtime questionnaire signal.
+        q = QuestionnaireState2.load_from_questionnaire_dir(args.questionnaire_dir)
+        logger.info(
+            "Loaded questionnaire_state2: routers=%d blocks=%d block_status=%d",
+            len(q.routers),
+            len(q.blocks),
+            len(q.block_status),
+        )
 
         # Init appium
         appium = AndroidAppiumClient(server_url=args.appium_url, device_name=args.device_name).init_connection()
@@ -207,9 +215,9 @@ def main(argv=None):
                 appium.force_stop(args.package)
             appium.quit()
 
-        # Export results (human-readable)
-        results = q.export_answers_by_namespace()
-        logger.info("Final answers by namespace:\n%s", results)
+        # New workflow stores per-UI observations for later merge; there is no
+        # old-style final answer export at runtime yet.
+        logger.info("Final block_status:\n%s", q.block_status)
 
     else:
         from device_utils import list_packages, list_processes, screenshot, dump_ui, install_apk

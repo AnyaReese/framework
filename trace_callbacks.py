@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ class StepCtx:
     ts: float
     cur_sig: str
     stack: List[str]
+    block_status: Dict[str, Any]
     open_gaps: List[str]
     answered_ratio: float
 
@@ -232,7 +234,7 @@ class InteractiveDebugCallbacks(NoOpCallbacks):
         self._print_block(
             f"流程决策: {name}",
             [
-                f"sig={self._short_sig(ctx.cur_sig)} gaps={len(ctx.open_gaps)} answered={ctx.answered_ratio:.2f}",
+                f"sig={self._short_sig(ctx.cur_sig)} blocks={len(ctx.block_status)}",
                 f"详情={self._short_text(json.dumps(detail, ensure_ascii=False), 220)}",
             ],
             pause_key="decision",
@@ -269,6 +271,7 @@ class JsonlTraceCallbacks(NoOpCallbacks):
                 "ts": ctx.ts,
                 "cur_sig": ctx.cur_sig,
                 "stack": ctx.stack,
+                "block_status": ctx.block_status,
                 "open_gaps": ctx.open_gaps,
                 "answered_ratio": ctx.answered_ratio,
             },
@@ -278,6 +281,19 @@ class JsonlTraceCallbacks(NoOpCallbacks):
         with self._lock:
             with open(self.trace_path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+
+    @staticmethod
+    def _safe_filename_token(value: Any, default: str = "state") -> str:
+        """
+        Convert state ids into Windows-safe filename tokens.
+
+        Why:
+        - New state_sig values may contain ":" (for example "xml:abcd...").
+        - On Windows, ":" creates an alternate data stream, causing normal
+          files to appear as 0-byte placeholders.
+        """
+        token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("_")
+        return token or default
 
     @staticmethod
     def _vid_map_summary(vid_map: Dict[Any, Any]) -> Dict[str, Any]:
@@ -417,7 +433,7 @@ class JsonlTraceCallbacks(NoOpCallbacks):
     # ------------ event handlers ------------
     def on_snapshot(self, ctx: StepCtx, snap: Dict[str, Any]) -> None:  # type: ignore[override]
         sig = str(snap.get("state_sig") or "")
-        prefix = f"{ctx.step_id:06d}_{sig[:8]}"
+        prefix = f"{ctx.step_id:06d}_{self._safe_filename_token(sig)[:48]}"
 
         screenshot_path = None
         screenshot_hash = None
