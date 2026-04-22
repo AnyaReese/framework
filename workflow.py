@@ -739,7 +739,7 @@ class WorkflowRunner:
 
         Processing:
         - If JsonlTraceCallbacks is active, write beside the trace under:
-          `<trace_run_root>/questionnaire2_observations`.
+          `<trace_run_root>/observations`.
         - Otherwise write to a stable debug folder under `mytest2`.
 
         Output:
@@ -748,9 +748,9 @@ class WorkflowRunner:
         """
         cb_root = str(getattr(self.callbacks, "root_dir", "") or "").strip()
         if cb_root:
-            return Path(cb_root) / "questionnaire2_observations"
+            return Path(cb_root) / "observations"
         run_token = self.run_id or time.strftime("%Y%m%d_%H%M%S")
-        return Path("mytest2") / "questionnaire_handler" / "chain_debug" / "workflow_questionnaire2_observations" / run_token
+        return Path("mytest2") / "questionnaire_handler" / "chain_debug" / "workflow_observations" / run_token
 
     def _save_questionnaire2_observation(
         self,
