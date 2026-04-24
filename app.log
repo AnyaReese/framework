@@ -521,3 +521,229 @@ Traceback (most recent call last):
   File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
     raise self._make_status_error_from_response(err.response) from None
 openai.RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit reached for gpt-4o in organization org-BfuRBBF4aPjQONrGpIABMcSq on tokens per min (TPM): Limit 30000, Used 28308, Requested 14806. Please try again in 26.228s. Visit https://platform.openai.com/account/rate-limits to learn more.', 'type': 'tokens', 'param': None, 'code': 'rate_limit_exceeded'}}
+[2026-04-24 13:50:55,964] INFO [__main__:167] Loaded questionnaire_state2: routers=9 blocks=39 block_status=39
+[2026-04-24 13:50:55,970] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-24 13:50:57,985] WARNING [urllib3.connectionpool:868] Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='127.0.0.1', port=4723): Failed to establish a new connection: [WinError 10061] 由于目标计算机积极拒绝，无法连接。")': /session
+[2026-04-24 13:51:10,632] INFO [__main__:167] Loaded questionnaire_state2: routers=9 blocks=39 block_status=39
+[2026-04-24 13:51:10,632] INFO [appium_android:139] Initializing Appium connection at http://127.0.0.1:4723
+[2026-04-24 13:51:12,937] INFO [appium_android:144] Appium driver created
+[2026-04-24 13:51:14,287] INFO [workflow:660] QuestionnaireState2 active: routers=9 blocks=39
+[2026-04-24 13:51:14,299] INFO [appium_android:208] Force-stop com.marktka.calculatorYou via adb
+[2026-04-24 13:51:15,131] DEBUG [appium_android:276] Capturing snapshot (xml + screenshot + device_info)
+[2026-04-24 13:51:16,191] DEBUG [appium_android:224] Page stable with hash=070e87b6fcfd10f8163efb8232c551f1
+[2026-04-24 13:51:16,570] DEBUG [ui_cls:1540] UIED-first post-process start: 1 root nodes; 56 nodes
+[2026-04-24 13:51:16,572] DEBUG [ui_cls:414] UIED start: key=40917f51f55e49acd739ef0b2e8c1490 output_root=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490 image=F:\workplace\framework\mytests\outputs\uied_runtime\40917f51f55e49acd739ef0b2e8c1490\40917f51f55e49acd739ef0b2e8c1490.png
+[2026-04-24 13:51:36,104] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:767e
+[2026-04-24 13:51:59,534] WARNING [workflow:1215] Overlay unresolved by LLM1 overlay_dismiss_actions; invoking recovery.
+[2026-04-24 13:52:02,896] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:767e
+[2026-04-24 13:52:26,008] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:eb0b
+[2026-04-24 13:52:33,281] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:eb0b
+[2026-04-24 13:52:50,500] ERROR [gpt_cls:1040] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit reached for gpt-4o in organization org-BfuRBBF4aPjQONrGpIABMcSq on tokens per min (TPM): Limit 30000, Used 26937, Requested 6927. Please try again in 7.728s. Visit https://platform.openai.com/account/rate-limits to learn more.', 'type': 'tokens', 'param': None, 'code': 'rate_limit_exceeded'}}
+[2026-04-24 13:53:09,535] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:46bc
+[2026-04-24 13:53:23,479] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:3325
+[2026-04-24 13:53:29,911] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:3325
+[2026-04-24 13:53:32,289] ERROR [gpt_cls:1040] Structured parse failed for propose_blocks_fill; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit reached for gpt-4o in organization org-BfuRBBF4aPjQONrGpIABMcSq on tokens per min (TPM): Limit 30000, Used 30000, Requested 2766. Please try again in 5.532s. Visit https://platform.openai.com/account/rate-limits to learn more.', 'type': 'tokens', 'param': None, 'code': 'rate_limit_exceeded'}}
+[2026-04-24 13:53:45,002] ERROR [gpt_cls:1040] Structured parse failed for propose_router_answers; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit reached for gpt-4o in organization org-BfuRBBF4aPjQONrGpIABMcSq on tokens per min (TPM): Limit 30000, Used 27520, Requested 3167. Please try again in 1.374s. Visit https://platform.openai.com/account/rate-limits to learn more.', 'type': 'tokens', 'param': None, 'code': 'rate_limit_exceeded'}}
+[2026-04-24 13:54:06,759] WARNING [workflow:3646] NAV timeout sig=xml:36a2 cancelled=False -> heuristics allowed.
+[2026-04-24 13:54:06,765] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:36a2
+[2026-04-24 13:54:39,723] ERROR [gpt_cls:1040] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1070, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.RateLimitError: Error code: 429 - {'error': {'message': 'Rate limit reached for gpt-4o in organization org-BfuRBBF4aPjQONrGpIABMcSq on tokens per min (TPM): Limit 30000, Used 25306, Requested 8848. Please try again in 8.308s. Visit https://platform.openai.com/account/rate-limits to learn more.', 'type': 'tokens', 'param': None, 'code': 'rate_limit_exceeded'}}
+[2026-04-24 13:54:43,445] WARNING [workflow:3646] NAV timeout sig=xml:33aa cancelled=False -> heuristics allowed.
+[2026-04-24 13:54:43,449] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:33aa
+[2026-04-24 13:54:45,289] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:33aa
+[2026-04-24 13:54:52,269] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:eb0b
+[2026-04-24 13:55:15,122] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:46bc
+[2026-04-24 13:55:21,714] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:46bc
+[2026-04-24 13:55:23,729] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:eb0b
+[2026-04-24 13:56:01,337] WARNING [workflow:3646] NAV timeout sig=xml:33aa cancelled=False -> heuristics allowed.
+[2026-04-24 13:56:01,341] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:33aa
+[2026-04-24 13:56:03,415] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:eb0b
+[2026-04-24 13:56:16,228] ERROR [gpt_cls:1040] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 250, in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 256, in handle_request
+    raise exc from None
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 236, in handle_request
+    response = connection.handle_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http_proxy.py", line 343, in handle_request
+    return self._connection.handle_request(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 136, in handle_request
+    raise exc
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 106, in handle_request
+    ) = self._receive_response_headers(**kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 177, in _receive_response_headers
+    event = self._receive_event(timeout=timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 231, in _receive_event
+    raise RemoteProtocolError(msg)
+httpcore.RemoteProtocolError: Server disconnected without sending a response.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1005, in request
+    response = self._client.send(
+               ^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 914, in send
+    response = self._send_handling_auth(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 942, in _send_handling_auth
+    response = self._send_handling_redirects(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 979, in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 1014, in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 249, in handle_request
+    with map_httpcore_exceptions():
+  File "C:\Users\ruogan\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 155, in __exit__
+    self.gen.throw(value)
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.RemoteProtocolError: Server disconnected without sending a response.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1037, in request
+    raise APIConnectionError(request=request) from err
+openai.APIConnectionError: Connection error.
+[2026-04-24 13:56:41,413] WARNING [workflow:3646] NAV timeout sig=xml:33aa cancelled=False -> heuristics allowed.
+[2026-04-24 13:56:41,416] WARNING [workflow:5150] No probe outcomes for forward selection at src_sig=xml:33aa
+[2026-04-24 13:57:53,623] ERROR [gpt_cls:1040] Structured parse failed for propose_navigation; falling back to JSON extraction.
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 250, in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 256, in handle_request
+    raise exc from None
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 236, in handle_request
+    response = connection.handle_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http_proxy.py", line 343, in handle_request
+    return self._connection.handle_request(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 136, in handle_request
+    raise exc
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 106, in handle_request
+    ) = self._receive_response_headers(**kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 177, in _receive_response_headers
+    event = self._receive_event(timeout=timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpcore\_sync\http11.py", line 231, in _receive_event
+    raise RemoteProtocolError(msg)
+httpcore.RemoteProtocolError: Server disconnected without sending a response.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1005, in request
+    response = self._client.send(
+               ^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 914, in send
+    response = self._send_handling_auth(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 942, in _send_handling_auth
+    response = self._send_handling_redirects(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 979, in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_client.py", line 1014, in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 249, in handle_request
+    with map_httpcore_exceptions():
+  File "C:\Users\ruogan\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 155, in __exit__
+    self.gen.throw(value)
+  File "F:\workplace\framework\.venv\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.RemoteProtocolError: Server disconnected without sending a response.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "F:\workplace\framework\gpt_cls.py", line 1026, in _call_structured
+    resp = self.client.beta.chat.completions.parse(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\resources\chat\completions\completions.py", line 191, in parse
+    return self._post(
+           ^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1297, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\workplace\framework\.venv\Lib\site-packages\openai\_base_client.py", line 1037, in request
+    raise APIConnectionError(request=request) from err
+openai.APIConnectionError: Connection error.

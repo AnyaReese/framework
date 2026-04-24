@@ -797,6 +797,33 @@ class WorkflowRunner:
             logger.debug("QuestionnaireState2 observation save failed sig=%s", sig[:8], exc_info=True)
             return None
 
+    def _save_nav_observation(self, sig: str, nav: NavigationProposal) -> Optional[Path]:
+        """
+        Persist one LLM1 (navigation) result per state.
+
+        Input:
+        - sig: current state signature.
+        - nav: LLM1 NavigationProposal.
+
+        Output:
+        - Path to written JSON, or None on failure.
+        """
+        try:
+            root = self._questionnaire2_observation_dir() / "nav"
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = int(time.time() * 1000)
+            safe_sig = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sig or "unknown")).strip("_") or "unknown"
+            out_path = root / f"{stamp}_{safe_sig}.json"
+            payload = {
+                "state_sig": sig,
+                "nav_result": nav.model_dump(mode="json") if hasattr(nav, "model_dump") else getattr(nav, "__dict__", {}),
+            }
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return out_path
+        except Exception:
+            logger.debug("NAV observation save failed sig=%s", str(sig)[:8], exc_info=True)
+            return None
+
     # ---------------------------
     # Structured log helpers
     # ---------------------------
@@ -3263,12 +3290,16 @@ class WorkflowRunner:
                         candidate_count=len(getattr(nav, "candidate_actions", []) or []),
                         duration_s=duration_s,
                     )
+                    nav_obs_path = self._save_nav_observation(sig, nav)
+                    if nav_obs_path is not None:
+                        self._log_event("nav_observation_saved", sig=sig, observation_path=str(nav_obs_path))
                     self._emit_llm_result(
                         "nav",
                         sig,
                         {
                             "state_sig": sig,
                             "duration_s": duration_s,
+                            "observation_path": str(nav_obs_path or ""),
                             "result": nav.model_dump(mode="json") if hasattr(nav, "model_dump") else getattr(nav, "__dict__", {}),
                         },
                     )
