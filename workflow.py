@@ -2024,13 +2024,17 @@ class WorkflowRunner:
             xml = self._preprocess_hierarchy_xml(xml_raw, crop_top_xml=crop_xml) if crop_xml > 0 else (xml_raw or "")
             xml_hash = hashlib.md5((xml or "").encode("utf-8")).hexdigest()
 
+            xml_reliable = count_meaningful_xml_nodes(xml) >= int(self.budget.meaningful_xml_nodes_threshold)
+            postprocess_mode = "xml_only" if xml_reliable else "uied_first"
+            logger.info("UIED mode: %s (xml_reliable=%s)", "skipped" if xml_reliable else "used", xml_reliable)
+
             raw_key = self._snapshot_cache_key(
                 xml_hash,
                 screenshot_hash,
                 coord_scale,
                 foreground_package=foreground_package,
                 foreground_activity=foreground_activity,
-            ) + ":uiedfirst"
+            ) + f":{postprocess_mode}"
             cached = self.snapshot_cache.get(raw_key)
             if cached:
                 self.snapshot_cache.move_to_end(raw_key)
@@ -2046,7 +2050,10 @@ class WorkflowRunner:
             else:
                 self.snapshot_cache_misses += 1
                 uist = self.appium.parse_xml_to_uist(xml, pixel_ratio=coord_scale)
-                uist2, vid_map = BaseUI.post_process_ui_uied_first(uist, screenshot_b64, device_info=info)
+                if xml_reliable:
+                    uist2, vid_map = BaseUI.post_process_ui(uist, screenshot_b64, device_info=info)
+                else:
+                    uist2, vid_map = BaseUI.post_process_ui_uied_first(uist, screenshot_b64, device_info=info)
                 sig = compute_state_signature(
                     uist2,
                     foreground_package=foreground_package,
@@ -2058,7 +2065,6 @@ class WorkflowRunner:
                     self.snapshot_cache.popitem(last=False)
                 self._log_event("snapshot_cache_miss", sig=sig, raw_key=raw_key, cache_size=len(self.snapshot_cache))
 
-            xml_reliable = count_meaningful_xml_nodes(xml) >= int(self.budget.meaningful_xml_nodes_threshold)
             coarse_sig = compute_coarse_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             struct_sig = compute_structural_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)
             fine_sig = compute_fine_signature(uist2, foreground_package=foreground_package, foreground_activity=foreground_activity)

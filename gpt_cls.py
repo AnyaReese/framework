@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import time
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Type, TypeVar, Union
 
@@ -1021,6 +1022,10 @@ class GPTClient:
         if self.client is None:
             raise RuntimeError(f"OpenAI client not available for {opname}")
 
+        start_ts = time.time()
+        stage = self._llm_stage_from_opname(opname)
+        state_sig = self._extract_state_sig(messages)
+
         # Preferred: structured parse
         try:
             resp = self.client.beta.chat.completions.parse(
@@ -1031,8 +1036,18 @@ class GPTClient:
                 response_format=model_cls,
             )
             try:
-                token_record(opname, resp.usage.prompt_tokens, resp.usage.completion_tokens)
-                logger.info("%s tokens: prompt=%s completion=%s", opname, resp.usage.prompt_tokens, resp.usage.completion_tokens)
+                prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or 0)
+                completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or 0)
+                token_record(opname, prompt_tokens, completion_tokens)
+                self._log_llm_usage(
+                    stage=stage,
+                    opname=opname,
+                    state_sig=state_sig,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    duration_s=(time.time() - start_ts),
+                    path="parse",
+                )
             except Exception:
                 pass
             return resp.choices[0].message.parsed
@@ -1049,7 +1064,18 @@ class GPTClient:
                     timeout=self.timeout_s,
                 )
                 try:
-                    token_record(opname, resp2.usage.prompt_tokens, resp2.usage.completion_tokens)
+                    prompt_tokens = int(getattr(resp2.usage, "prompt_tokens", 0) or 0)
+                    completion_tokens = int(getattr(resp2.usage, "completion_tokens", 0) or 0)
+                    token_record(opname, prompt_tokens, completion_tokens)
+                    self._log_llm_usage(
+                        stage=stage,
+                        opname=opname,
+                        state_sig=state_sig,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        duration_s=(time.time() - start_ts),
+                        path="create",
+                    )
                 except Exception:
                     pass
                 text = resp2.choices[0].message.content or ""
@@ -1063,7 +1089,18 @@ class GPTClient:
                 )
                 try:
                     usage = resp2.get("usage") or {}
-                    token_record(opname, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)))
+                    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                    token_record(opname, prompt_tokens, completion_tokens)
+                    self._log_llm_usage(
+                        stage=stage,
+                        opname=opname,
+                        state_sig=state_sig,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        duration_s=(time.time() - start_ts),
+                        path="legacy_create",
+                    )
                 except Exception:
                     pass
                 text = ((resp2.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
@@ -1076,6 +1113,75 @@ class GPTClient:
             return model_cls.parse_obj(data)  # type: ignore[return-value]
         except Exception as exc:
             raise RuntimeError(f"LLM call failed for {opname}: {exc}") from exc
+
+    @staticmethod
+    def _llm_stage_from_opname(opname: str) -> str:
+        if opname == "propose_navigation":
+            return "LLM1"
+        if opname in {
+            "propose_questionnaire_updates",
+            "propose_topic_routes",
+            "propose_topic_fill",
+            "propose_router_answers",
+            "propose_block_fill",
+            "propose_blocks_fill",
+        }:
+            return "LLM2"
+        if opname == "recover_state":
+            return "LLM3"
+        return "LLM"
+
+    @staticmethod
+    def _extract_state_sig(messages: List[Dict[str, Any]]) -> str:
+        for msg in reversed(messages or []):
+            content = msg.get("content")
+            try:
+                if isinstance(content, str):
+                    payload = json.loads(content)
+                    sig = str((payload or {}).get("state_sig") or "").strip()
+                    if sig:
+                        return sig
+                elif isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if str(item.get("type") or "") != "text":
+                            continue
+                        text = str(item.get("text") or "").strip()
+                        if not text:
+                            continue
+                        payload = json.loads(text)
+                        sig = str((payload or {}).get("state_sig") or "").strip()
+                        if sig:
+                            return sig
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _log_llm_usage(
+        *,
+        stage: str,
+        opname: str,
+        state_sig: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        duration_s: float,
+        path: str,
+    ) -> None:
+        total_tokens = int(prompt_tokens) + int(completion_tokens)
+        sig8 = (state_sig or "")[:8]
+        logger.info(
+            "LLM_USAGE stage=%s op=%s sig=%s prompt=%d completion=%d total=%d duration_s=%.3f path=%s",
+            stage,
+            opname,
+            sig8,
+            int(prompt_tokens),
+            int(completion_tokens),
+            total_tokens,
+            float(duration_s),
+            path,
+        )
 
 
 
