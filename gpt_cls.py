@@ -306,6 +306,30 @@ class RouterResult(BaseModel):
     )
 
 
+class AppMetadataSummary(BaseModel):
+    """
+    One-shot summary generated from app-level metadata (store description/category/etc.).
+    This output is intended to be reused as stable context in later LLM calls.
+    """
+    app_id: str = Field("", description="App package id (e.g., com.example.app)")
+    app_intro: str = Field("", description="One-sentence app overview inferred from description fields")
+    focus_hints: str = Field(
+        "",
+        description=(
+            "Potential content focus hints for UI review, written as short phrases separated by semicolons. "
+            "Leave empty when evidence is insufficient."
+        ),
+    )
+    questionnaire_type: Literal["games", "social", "others", ""] = Field(
+        "",
+        description="Questionnaire bucket inferred from genre fields. Empty when insufficient evidence.",
+    )
+    notes: str = Field(
+        "",
+        description="Brief reason when any output field is empty (e.g., missing source field, empty value, garbled text).",
+    )
+
+
 def _safe_json_from_text(text: str) -> Dict[str, Any]:
     if not text:
         raise ValueError("Empty model output")
@@ -502,6 +526,68 @@ RULES:
 - Router questions are provided as a flat list. Treat `show_if` only as background context, not as an availability gate.
 - For multiple-choice routers, `new_answer` should be a list of option ids.
 - For single-choice routers, `new_answer` should be one option id string.
+"""
+
+_APP_METADATA_SYSTEM = """You are an assistant that summarizes Android app metadata for downstream UI analysis.
+
+GOAL:
+- Convert selected app metadata fields into a compact reusable context for later app UI exploration and UI analysis.
+- Keep the output factual and concise; do not invent details not supported by the metadata.
+
+INPUTS:
+- app_id:
+  - Android package id (unique app identifier).
+- app_metadata: contains only the following selected fields:
+  - description
+    - Main app-store description text; primary source for app functionality/content.
+  - descriptionHTML
+    - HTML-formatted description text; may overlap with description and include markup artifacts.
+  - summary
+    - Short app tagline/summary of core purpose.
+  - contentRating
+    - Store-provided content-rating label.
+  - contentRatingDescription
+    - Optional explanation text for the content-rating decision.
+  - offersIAP
+    - Whether the app provides in-app purchases.
+  - inAppProductPrice
+    - In-app purchase price range or price note.
+  - genre
+    - Human-readable app category.
+  - genreId
+    - Normalized category id from store taxonomy.
+  - categories
+    - Category list payload (often serialized list/dict string).
+
+WORKFLOW:
+1) Build `app_intro` (based on description / descriptionHTML / summary).
+   - Output one concise sentence that briefly introduces the app and provides hints for subsequent app exploration and UI analysis.
+   - Do not mention the app's specific name; refer to it as "the app".
+
+2) Build `focus_hints` (primarily based on contentRating / contentRatingDescription / offersIAP / inAppProductPrice, and also referencing description / descriptionHTML / summary).
+   - Output short natural-language review hints for downstream UI inspection, summarizing what types of content in the app may affect age-related content considerations.
+   - Format as semicolon-separated phrases, where each phrase represents one aspect.
+   - IMPORTANT: do NOT explicitly output the app's age rating; only describe the related content.
+
+3) Infer `questionnaire_type` (based on genre / genreId / categories).
+   - Based on the app's category/type information, determine which questionnaire type applies.
+   - The output must be exactly one of: games | social_apps | others.
+
+4) Fill `notes`.
+   - If any of the above three fields is empty, briefly explain why:
+     e.g., missing source field, empty source value, garbled/unusable text, or insufficient evidence.
+   - If all fields are confidently filled, `notes` should be empty.
+
+OUTPUT (strict JSON matching AppMetadataSummary):
+- app_id
+- app_intro
+- focus_hints
+- questionnaire_type
+- notes
+
+RULES:
+- Use only provided information; no guessing.
+- Follow output format strictly.
 """
 
 
@@ -871,6 +957,58 @@ class GPTClient:
         out = self._call_structured(messages, RouterResult, opname="propose_router_answers")
         out.router_updates = list(out.router_updates or [])[:12]
         out.state_sig = state_sig or out.state_sig
+        return out
+
+    @time_consumed
+    def analyze_app_metadata(
+        self,
+        app_id: str,
+        app_metadata: Dict[str, Any],
+    ) -> AppMetadataSummary:
+        """
+        Analyze selected app metadata fields and return a compact reusable summary.
+
+        Inputs:
+        - app_id:
+          App package id, usually from CSV column `appId`.
+        - app_metadata:
+          Selected metadata fields only (description/summary/rating/iap/genre related).
+
+        Processing:
+        - Keep payload compact (trim long string fields).
+        - Ask structured LLM with AppMetadataSummary schema.
+
+        Output:
+        - AppMetadataSummary:
+          app_intro + focus_hints + questionnaire_type (+ notes for empty fields).
+        """
+        compact_meta: Dict[str, Any] = {}
+        for k, v in (app_metadata or {}).items():
+            key = str(k or "").strip()
+            if not key:
+                continue
+            if v is None:
+                compact_meta[key] = ""
+                continue
+            s = str(v)
+            compact_meta[key] = s[:4000] if len(s) > 4000 else s
+
+        payload = {
+            "app_id": app_id,
+            "app_metadata": compact_meta,
+        }
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _APP_METADATA_SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+        out = self._call_structured(messages, AppMetadataSummary, opname="analyze_app_metadata")
+        out.app_id = app_id or out.app_id
+        out.app_intro = str(out.app_intro or "")[:280]
+        out.focus_hints = str(out.focus_hints or "")[:500]
+        out.notes = str(out.notes or "")[:500]
+        if out.questionnaire_type not in ("games", "social", "others", ""):
+            out.questionnaire_type = ""
         return out
 
     @time_consumed
