@@ -20,6 +20,7 @@ WORKFLOW CONTRACT:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -320,7 +321,7 @@ class AppMetadataSummary(BaseModel):
             "Leave empty when evidence is insufficient."
         ),
     )
-    questionnaire_type: Literal["games", "social", "others", ""] = Field(
+    questionnaire_type: Literal["games", "social_apps", "others", ""] = Field(
         "",
         description="Questionnaire bucket inferred from genre fields. Empty when insufficient evidence.",
     )
@@ -400,6 +401,8 @@ INPUTS:
 - state_sig: current UI signature (used to detect stale plans)
 - task: exploration goal string
 - block_status: mapping of block_id -> {topic?, hit_count, visit_count, module?}
+- app_intro: one-sentence app-level description inferred from metadata (may be empty/None)
+- focus_hints: semicolon-separated app-level content focus hints inferred from metadata (may be empty/None)
 - ui_digest: structured UI nodes with stable ids (YOU MUST reference these ids)
 - screenshot: actual rendered screen image
 - history: recent executed actions (context only)
@@ -442,9 +445,12 @@ REQUIRED OUTPUT (strict JSON matching NavigationProposal):
    - Global return_method/return_actions are only defaults when a candidate leaves them empty.
 
 6) DO NOT:
-   - invent element_ids not in ui_digest
-   - spam random clicks
-   - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
+  - invent element_ids not in ui_digest
+  - spam random clicks
+  - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
+7) APP CONTEXT USAGE:
+   - app_intro/focus_hints are weak priors only.
+   - If they conflict with current-screen evidence, trust current-screen evidence.
 """
 #prompt调整
 
@@ -499,6 +505,8 @@ GOAL:
 
 INPUTS:
 - state_sig: UI signature for staleness/debug
+- app_intro: one-sentence app-level description inferred from metadata (may be empty/None)
+- focus_hints: semicolon-separated app-level content focus hints inferred from metadata (may be empty/None)
 - router_questions: router question entries:
   {
     id,
@@ -526,6 +534,7 @@ RULES:
 - Router questions are provided as a flat list. Treat `show_if` only as background context, not as an availability gate.
 - For multiple-choice routers, `new_answer` should be a list of option ids.
 - For single-choice routers, `new_answer` should be one option id string.
+- app_intro/focus_hints are weak priors only; current-screen evidence has priority.
 """
 
 _APP_METADATA_SYSTEM = """You are an assistant that summarizes Android app metadata for downstream UI analysis.
@@ -624,6 +633,8 @@ GOAL:
 
 INPUTS:
 - state_sig: UI signature for staleness/debug
+- app_intro: one-sentence app-level description inferred from metadata (may be empty/None)
+- focus_hints: semicolon-separated app-level content focus hints inferred from metadata (may be empty/None)
 - block_payload:
   {
     id,
@@ -652,6 +663,7 @@ RULES:
 - Prefer precision over recall. If unsure, omit.
 - Never answer "No" only because evidence is absent.
 - Use question ids from `block_payload.questions` as `question_id` in proposed_updates.
+- app_intro/focus_hints are weak priors only; current-screen evidence has priority.
 - Category hints for future merge:
   - mutual: options are different meanings; answer only the visibly supported option.
   - severity: options imply severity; answer the visibly supported severity.
@@ -670,6 +682,8 @@ GOAL:
 
 INPUTS:
 - state_sig: UI signature for debugging
+- app_intro: one-sentence app-level description inferred from metadata (may be empty/None)
+- focus_hints: semicolon-separated app-level content focus hints inferred from metadata (may be empty/None)
 - blocks: list of block payloads:
   {
     id,
@@ -702,6 +716,7 @@ RULES:
 - For multi-select questions: new_answer should be a list of option ids.
 - Prefer precision over recall. If unsure, omit.
 - Never answer "No" only because evidence is absent.
+- app_intro/focus_hints are weak priors only; current-screen evidence has priority.
 - Respect internal question show_if: answer a child only when its parent answer is supported in the same block.
 - Category hints:
   - mutual: choose the visible matching meaning.
@@ -744,6 +759,10 @@ class GPTClient:
         self.model = model
         self.temperature = float(temperature)
         self.timeout_s = int(timeout_s)
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        self.total_llm_calls: int = 0
+        self.usage_by_op: Dict[str, Dict[str, int]] = {}
 
         self.client = None
         try:
@@ -765,6 +784,8 @@ class GPTClient:
         ui_json: Dict[str, Any],
         block_status: Dict[str, Any],
         task: str,
+        app_intro: Optional[str] = None,
+        focus_hints: Optional[str] = None,
         history: Optional[List[str]] = None,
         state_sig: str = "",
     ) -> NavigationProposal:
@@ -790,6 +811,8 @@ class GPTClient:
             "state_sig": state_sig,
             "task": task,
             "block_status": block_status,
+            "app_intro": app_intro,
+            "focus_hints": focus_hints,
             "history": (history or [])[-12:],
             "ui_digest": ui_digest,
         }
@@ -921,6 +944,8 @@ class GPTClient:
         self,
         screenshot_b64: str,
         router_questions: List[Dict[str, Any]],
+        app_intro: Optional[str] = None,
+        focus_hints: Optional[str] = None,
         state_sig: str = "",
     ) -> RouterResult:
         """
@@ -940,6 +965,8 @@ class GPTClient:
         """
         payload = {
             "state_sig": state_sig,
+            "app_intro": app_intro,
+            "focus_hints": focus_hints,
             "router_questions": router_questions[:40],
         }
 
@@ -1007,7 +1034,7 @@ class GPTClient:
         out.app_intro = str(out.app_intro or "")[:280]
         out.focus_hints = str(out.focus_hints or "")[:500]
         out.notes = str(out.notes or "")[:500]
-        if out.questionnaire_type not in ("games", "social", "others", ""):
+        if out.questionnaire_type not in ("games", "social_apps", "others", ""):
             out.questionnaire_type = ""
         return out
 
@@ -1016,6 +1043,8 @@ class GPTClient:
         self,
         screenshot_b64: str,
         block_payload: Dict[str, Any],
+        app_intro: Optional[str] = None,
+        focus_hints: Optional[str] = None,
         state_sig: str = "",
     ) -> QuestionnaireUpdate:
         """
@@ -1047,6 +1076,8 @@ class GPTClient:
         """
         payload = {
             "state_sig": state_sig,
+            "app_intro": app_intro,
+            "focus_hints": focus_hints,
             "block_payload": block_payload,
         }
 
@@ -1070,6 +1101,8 @@ class GPTClient:
         self,
         screenshot_b64: str,
         blocks_payload: List[Dict[str, Any]],
+        app_intro: Optional[str] = None,
+        focus_hints: Optional[str] = None,
         state_sig: str = "",
     ) -> BlocksFillResult:
         """
@@ -1090,6 +1123,8 @@ class GPTClient:
         """
         payload = {
             "state_sig": state_sig,
+            "app_intro": app_intro,
+            "focus_hints": focus_hints,
             "blocks": blocks_payload,
         }
 
@@ -1165,46 +1200,69 @@ class GPTClient:
         state_sig = self._extract_state_sig(messages)
 
         # Preferred: structured parse
-        try:
-            resp = self.client.beta.chat.completions.parse(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                timeout=self.timeout_s,
-                response_format=model_cls,
-            )
+        while True:
             try:
-                prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or 0)
-                completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or 0)
-                token_record(opname, prompt_tokens, completion_tokens)
-                self._log_llm_usage(
-                    stage=stage,
-                    opname=opname,
-                    state_sig=state_sig,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    duration_s=(time.time() - start_ts),
-                    path="parse",
-                )
-            except Exception:
-                pass
-            return resp.choices[0].message.parsed
-        except Exception:
-            logger.error("Structured parse failed for %s; falling back to JSON extraction.", opname, exc_info=True)
-
-        # Fallback: normal completion (best-effort across OpenAI client versions)
-        try:
-            if hasattr(self.client, "chat") and hasattr(self.client.chat, "completions"):
-                resp2 = self.client.chat.completions.create(
+                resp = self.client.beta.chat.completions.parse(
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
                     timeout=self.timeout_s,
+                    response_format=model_cls,
                 )
+                try:
+                    prompt_tokens = int(getattr(resp.usage, "prompt_tokens", 0) or 0)
+                    completion_tokens = int(getattr(resp.usage, "completion_tokens", 0) or 0)
+                    self._record_token_usage(opname, prompt_tokens, completion_tokens)
+                    self._log_llm_usage(
+                        stage=stage,
+                        opname=opname,
+                        state_sig=state_sig,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        duration_s=(time.time() - start_ts),
+                        path="parse",
+                    )
+                except Exception:
+                    pass
+                return resp.choices[0].message.parsed
+            except Exception as exc:
+                if self._is_rate_limit_error(exc):
+                    logger.warning(
+                        "Rate limited for %s (parse). Sleep 10s then retry. err=%s",
+                        opname,
+                        str(exc)[:300],
+                    )
+                    time.sleep(10.0)
+                    continue
+                logger.error("Structured parse failed for %s; falling back to JSON extraction.", opname, exc_info=True)
+                break
+
+        # Fallback: normal completion (best-effort across OpenAI client versions)
+        try:
+            if hasattr(self.client, "chat") and hasattr(self.client.chat, "completions"):
+                while True:
+                    try:
+                        resp2 = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            timeout=self.timeout_s,
+                        )
+                        break
+                    except Exception as exc:
+                        if self._is_rate_limit_error(exc):
+                            logger.warning(
+                                "Rate limited for %s (create). Sleep 10s then retry. err=%s",
+                                opname,
+                                str(exc)[:300],
+                            )
+                            time.sleep(10.0)
+                            continue
+                        raise
                 try:
                     prompt_tokens = int(getattr(resp2.usage, "prompt_tokens", 0) or 0)
                     completion_tokens = int(getattr(resp2.usage, "completion_tokens", 0) or 0)
-                    token_record(opname, prompt_tokens, completion_tokens)
+                    self._record_token_usage(opname, prompt_tokens, completion_tokens)
                     self._log_llm_usage(
                         stage=stage,
                         opname=opname,
@@ -1219,17 +1277,30 @@ class GPTClient:
                 text = resp2.choices[0].message.content or ""
             elif hasattr(self.client, "ChatCompletion"):
                 # legacy module-style client
-                resp2 = self.client.ChatCompletion.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=self.temperature,
-                    timeout=self.timeout_s,
-                )
+                while True:
+                    try:
+                        resp2 = self.client.ChatCompletion.create(
+                            model=self.model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            timeout=self.timeout_s,
+                        )
+                        break
+                    except Exception as exc:
+                        if self._is_rate_limit_error(exc):
+                            logger.warning(
+                                "Rate limited for %s (legacy_create). Sleep 10s then retry. err=%s",
+                                opname,
+                                str(exc)[:300],
+                            )
+                            time.sleep(10.0)
+                            continue
+                        raise
                 try:
                     usage = resp2.get("usage") or {}
                     prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
                     completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-                    token_record(opname, prompt_tokens, completion_tokens)
+                    self._record_token_usage(opname, prompt_tokens, completion_tokens)
                     self._log_llm_usage(
                         stage=stage,
                         opname=opname,
@@ -1251,6 +1322,52 @@ class GPTClient:
             return model_cls.parse_obj(data)  # type: ignore[return-value]
         except Exception as exc:
             raise RuntimeError(f"LLM call failed for {opname}: {exc}") from exc
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """
+        Detect OpenAI token/request rate-limit exceptions in a version-tolerant way.
+        """
+        if exc is None:
+            return False
+        name = str(type(exc).__name__ or "").lower()
+        text = str(exc or "").lower()
+        if "ratelimit" in name or "rate_limit" in name:
+            return True
+        if "rate limit" in text or "rate_limit" in text:
+            return True
+        if "error code: 429" in text or "status code: 429" in text:
+            return True
+        return False
+
+    def _record_token_usage(self, opname: str, prompt_tokens: int, completion_tokens: int) -> None:
+        """
+        Record token usage in both legacy utils tracker and local aggregate counters.
+        """
+        token_record(opname, int(prompt_tokens), int(completion_tokens))
+        self.total_prompt_tokens += int(prompt_tokens)
+        self.total_completion_tokens += int(completion_tokens)
+        self.total_llm_calls += 1
+        row = self.usage_by_op.setdefault(
+            str(opname or ""),
+            {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        )
+        row["calls"] += 1
+        row["prompt_tokens"] += int(prompt_tokens)
+        row["completion_tokens"] += int(completion_tokens)
+        row["total_tokens"] += int(prompt_tokens) + int(completion_tokens)
+
+    def usage_summary(self) -> Dict[str, Any]:
+        """
+        Return aggregate LLM token usage collected during this process.
+        """
+        return {
+            "calls": int(self.total_llm_calls),
+            "prompt_tokens": int(self.total_prompt_tokens),
+            "completion_tokens": int(self.total_completion_tokens),
+            "total_tokens": int(self.total_prompt_tokens + self.total_completion_tokens),
+            "by_op": copy.deepcopy(self.usage_by_op),
+        }
 
     @staticmethod
     def _llm_stage_from_opname(opname: str) -> str:

@@ -489,6 +489,15 @@ class WorkflowRunner:
 
     pause: bool = False
 
+    # App-level metadata context (computed before run starts).
+    app_intro: Optional[str] = None
+    focus_hints: Optional[str] = None
+    questionnaire_type: str = ""
+    questionnaire_type_source: str = "manual"
+    metadata_csv_path: str = ""
+    metadata_entry_found: bool = False
+    metadata_notes: str = ""
+
     callbacks: Callbacks = field(default_factory=NoOpCallbacks)
     run_id: str = ""
 
@@ -620,6 +629,7 @@ class WorkflowRunner:
     # (src_sig, dst_sig, action_key, src_family, dst_family)
     recent_transitions: List[Tuple[str, str, str, str, str]] = field(default_factory=list, init=False)
     loop_detected_count: int = field(default=0, init=False)
+    analysis_export_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         cb_run = getattr(self.callbacks, "run_id", None)
@@ -664,6 +674,7 @@ class WorkflowRunner:
             )
         except Exception:
             logger.debug("QuestionnaireState2 summary failed", exc_info=True)
+        self._save_app_metadata_context()
 
     # ---------------------------
     # Trace helpers
@@ -752,6 +763,49 @@ class WorkflowRunner:
         run_token = self.run_id or time.strftime("%Y%m%d_%H%M%S")
         return Path("mytest2") / "questionnaire_handler" / "chain_debug" / "workflow_observations" / run_token
 
+    def _run_output_root(self) -> Path:
+        """
+        Return the run-level root directory for auxiliary artifacts.
+
+        - With trace callbacks: <trace_run_root>
+        - Without trace callbacks: local debug run folder
+        """
+        cb_root = str(getattr(self.callbacks, "root_dir", "") or "").strip()
+        if cb_root:
+            return Path(cb_root)
+        run_token = self.run_id or time.strftime("%Y%m%d_%H%M%S")
+        return Path("mytest2") / "questionnaire_handler" / "chain_debug" / "workflow_observations" / run_token
+
+    def _save_app_metadata_context(self) -> Optional[Path]:
+        """
+        Persist app-level metadata context once per run for reproducibility.
+
+        Output:
+        - Path to `app_metadata_context.json`, or None on failure.
+        """
+        try:
+            out_root = self._run_output_root()
+            out_root.mkdir(parents=True, exist_ok=True)
+            out_path = out_root / "app_metadata_context.json"
+            payload = {
+                "run_id": self.run_id,
+                "target_package": str(self.target_package or ""),
+                "questionnaire_type": str(self.questionnaire_type or ""),
+                "questionnaire_type_source": str(self.questionnaire_type_source or ""),
+                "app_intro": self.app_intro,
+                "focus_hints": self.focus_hints,
+                "metadata_csv_path": str(self.metadata_csv_path or ""),
+                "metadata_entry_found": bool(self.metadata_entry_found),
+                "metadata_notes": str(self.metadata_notes or ""),
+                "saved_at": int(time.time() * 1000),
+            }
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._log_event("app_metadata_context_saved", sig="", path=str(out_path))
+            return out_path
+        except Exception:
+            logger.debug("Failed to save app_metadata_context", exc_info=True)
+            return None
+
     def _save_questionnaire2_observation(
         self,
         sig: str,
@@ -822,6 +876,211 @@ class WorkflowRunner:
             return out_path
         except Exception:
             logger.debug("NAV observation save failed sig=%s", str(sig)[:8], exc_info=True)
+            return None
+
+    @staticmethod
+    def _jsonable(value: Any) -> Any:
+        """Best-effort conversion for dataclass/pydantic/custom objects into JSON-safe values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): WorkflowRunner._jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [WorkflowRunner._jsonable(v) for v in value]
+        if hasattr(value, "model_dump"):
+            try:
+                return WorkflowRunner._jsonable(value.model_dump(mode="json"))
+            except Exception:
+                pass
+        if hasattr(value, "__dict__"):
+            try:
+                return WorkflowRunner._jsonable(vars(value))
+            except Exception:
+                pass
+        return str(value)
+
+    def _candidate_snapshot(self, cand: Any) -> Dict[str, Any]:
+        """Serialize ActionCandidate-like objects for analysis export."""
+        try:
+            score = float(getattr(cand, "score", 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        try:
+            tags = [str(x) for x in (getattr(cand, "tags", None) or [])[:8]]
+        except Exception:
+            tags = []
+        actions: List[Dict[str, Any]] = []
+        try:
+            for step in list(getattr(cand, "actions", None) or [])[:4]:
+                try:
+                    actions.append(
+                        {
+                            "action": str(getattr(step, "action", "") or ""),
+                            "element_id": getattr(step, "element_id", None),
+                            "text": str(getattr(step, "text", "") or ""),
+                            "reasoning": str(getattr(step, "reasoning", "") or ""),
+                        }
+                    )
+                except Exception:
+                    actions.append({"raw": str(step)})
+        except Exception:
+            pass
+        return {
+            "candidate_key": self._candidate_key(cand),
+            "score": score,
+            "tags": tags,
+            "actions": actions,
+        }
+
+    def _collect_state_action_snapshot(self) -> Dict[str, Any]:
+        """
+        Build a per-state summary: explored/attempted/remaining candidates.
+        Remaining candidates are the primary signal for unfinished DFS work.
+        """
+        per_state: Dict[str, Any] = {}
+        all_states: Set[str] = set(self.graph.nodes.keys()) | set(self.sig_to_family.keys())
+
+        for sig in sorted(all_states):
+            fam = self._family_id(sig)
+            candidates = list(self.state_candidates.get(fam) or [])
+            if not candidates:
+                nav = self.nav_cache.get(sig)
+                if nav and getattr(nav, "candidate_actions", None) is not None:
+                    candidates = list(getattr(nav, "candidate_actions") or [])
+
+            candidate_rows: List[Dict[str, Any]] = []
+            candidate_keys: List[str] = []
+            for cand in candidates:
+                if not getattr(cand, "actions", None):
+                    continue
+                row = self._candidate_snapshot(cand)
+                key = str(row.get("candidate_key") or "")
+                if not key:
+                    continue
+                candidate_rows.append(row)
+                candidate_keys.append(key)
+
+            explored = set(self.explored_actions.get(fam, set()))
+            attempted = set(self.attempted_actions.get(fam, set()))
+            remaining = [k for k in candidate_keys if k not in explored]
+            per_state[sig] = {
+                "state_sig": sig,
+                "family_id": fam,
+                "candidate_count": len(candidate_keys),
+                "explored_count": len([k for k in candidate_keys if k in explored]),
+                "attempted_count": len([k for k in candidate_keys if k in attempted]),
+                "remaining_count": len(remaining),
+                "is_exhausted": len(candidate_keys) > 0 and len(remaining) == 0,
+                "candidate_keys": candidate_keys,
+                "remaining_candidate_keys": remaining,
+                "explored_keys": sorted(explored),
+                "attempted_keys": sorted(attempted),
+                "candidates": candidate_rows,
+            }
+
+        return {
+            "per_state": per_state,
+            "unfinished_states": sorted([sig for sig, row in per_state.items() if int(row.get("remaining_count", 0) or 0) > 0]),
+        }
+
+    def _export_analysis_snapshot(self, *, cur_sig: str, stop_reason: str) -> Optional[Path]:
+        """
+        Export run-time analysis artifacts for post-stop visualization.
+        Files are overwritten by the latest snapshot.
+        """
+        try:
+            out_dir = self._run_output_root() / "analysis"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            graph_nodes: Dict[str, Any] = {}
+            for sig, node in (self.graph.nodes or {}).items():
+                graph_nodes[sig] = {
+                    "sig": sig,
+                    "visit_count": int(getattr(node, "visit_count", 0) or 0),
+                    "first_ts": float(getattr(node, "first_ts", 0.0) or 0.0),
+                    "last_ts": float(getattr(node, "last_ts", 0.0) or 0.0),
+                    "overlay_kind": str(getattr(node, "overlay_kind", "none") or "none"),
+                    "meta": self._jsonable(getattr(node, "meta", {}) or {}),
+                    "outgoing_count": len(getattr(node, "outgoing", set()) or set()),
+                    "incoming_count": len(getattr(node, "incoming", set()) or set()),
+                }
+            graph_edges: List[Dict[str, Any]] = []
+            for edge in (self.graph.edges or {}).values():
+                graph_edges.append(
+                    {
+                        "src": str(getattr(edge, "src", "") or ""),
+                        "dst": str(getattr(edge, "dst", "") or ""),
+                        "action": self._jsonable(getattr(edge, "action", {}) or {}),
+                        "count": int(getattr(edge, "count", 0) or 0),
+                        "no_effect": bool(getattr(edge, "no_effect", False)),
+                        "verified_ok": int(getattr(edge, "verified_ok", 0) or 0),
+                        "verified_fail": int(getattr(edge, "verified_fail", 0) or 0),
+                        "last_ts": float(getattr(edge, "last_ts", 0.0) or 0.0),
+                        "last_verified_ts": float(getattr(edge, "last_verified_ts", 0.0) or 0.0),
+                    }
+                )
+            graph_payload = {
+                "run_id": self.run_id,
+                "cur_sig": cur_sig,
+                "entry_sig": self.entry_sig,
+                "restart_entry_sig": self.restart_entry_sig,
+                "stop_reason": stop_reason,
+                "node_count": len(graph_nodes),
+                "edge_count": len(graph_edges),
+                "nodes": graph_nodes,
+                "edges": graph_edges,
+            }
+            (out_dir / "state_graph_snapshot.json").write_text(
+                json.dumps(graph_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            dfs_payload = {
+                "run_id": self.run_id,
+                "cur_sig": cur_sig,
+                "stop_reason": stop_reason,
+                "entry_sig": self.entry_sig,
+                "restart_entry_sig": self.restart_entry_sig,
+                "dfs_stack": list(self.dfs_stack),
+                "dfs_via": list(self.dfs_via),
+                "parent_map": dict(self.parent_map),
+                "stack_depth": len(self.dfs_stack),
+            }
+            (out_dir / "dfs_snapshot.json").write_text(
+                json.dumps(dfs_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            action_payload = self._collect_state_action_snapshot()
+            (out_dir / "state_action_snapshot.json").write_text(
+                json.dumps(action_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            self.analysis_export_count += 1
+            summary_payload = {
+                "run_id": self.run_id,
+                "export_seq": self.analysis_export_count,
+                "exported_at": int(time.time() * 1000),
+                "stop_reason": stop_reason,
+                "cur_sig": cur_sig,
+                "entry_sig": self.entry_sig,
+                "action_count": int(self.action_count),
+                "no_new_state_count": int(self.no_new_state_count),
+                "no_progress_loops": int(self.no_progress_loops),
+                "graph_node_count": int(len(graph_nodes)),
+                "graph_edge_count": int(len(graph_edges)),
+                "dfs_stack_depth": int(len(self.dfs_stack)),
+                "unfinished_state_count": int(len(action_payload.get("unfinished_states", []) or [])),
+            }
+            (out_dir / "run_analysis_summary.json").write_text(
+                json.dumps(summary_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._log_event("analysis_snapshot_exported", sig=cur_sig, out_dir=str(out_dir), stop_reason=stop_reason)
+            return out_dir
+        except Exception:
+            logger.debug("Failed to export analysis snapshot", exc_info=True)
             return None
 
     # ---------------------------
@@ -1056,9 +1315,13 @@ class WorkflowRunner:
         # 主循环：不断围绕“当前页面”做分析、探测、前进、回退、恢复，直到触发停止条件。
         while True:
             # 每轮一开始先看是否应该结束，例如超时、动作数超限、长时间没新状态等。
-            if self._stop_condition(start):
+            stop_reason = self._stop_condition_reason(start)
+            if stop_reason:
                 # 记录停止日志，方便从 trace / log 中看 run 为什么结束。
-                logger.info("Stop condition reached.")
+                logger.warning("Stop condition reached: %s", stop_reason)
+                print(f"[STOP] {stop_reason}")
+                self._log_event("run_stop_condition", sig=cur_sig, reason=stop_reason)
+                self._export_analysis_snapshot(cur_sig=cur_sig, stop_reason=stop_reason)
                 # 跳出主循环，进入资源清理阶段。
                 break
 
@@ -1581,6 +1844,10 @@ class WorkflowRunner:
         # 清理失败不影响 run 的最终返回，所以这里吞掉异常。
         except Exception:
             pass
+        try:
+            self._export_analysis_snapshot(cur_sig=cur_sig, stop_reason="run_exit")
+        except Exception:
+            logger.debug("final analysis export failed", exc_info=True)
 
     # ---------------------------
     # Snapshot
@@ -3073,6 +3340,8 @@ class WorkflowRunner:
                     {
                         "state_sig": sig,
                         "block_status": block_status,
+                        "app_intro": self.app_intro,
+                        "focus_hints": self.focus_hints,
                         "task": task,
                         "history": list(self.history),
                         "enqueue_ts": self._nav_enqueue_ts[sig],
@@ -3080,12 +3349,14 @@ class WorkflowRunner:
                 )
                 self._nav_futures[sig] = self._pool.submit(
                     self.gpt.propose_navigation,
-                    snap["screenshot"],
-                    snap["uist"],
-                    block_status,
-                    task,
-                    list(self.history),
-                    sig,
+                    screenshot_b64=snap["screenshot"],
+                    ui_json=snap["uist"],
+                    block_status=block_status,
+                    task=task,
+                    app_intro=self.app_intro,
+                    focus_hints=self.focus_hints,
+                    history=list(self.history),
+                    state_sig=sig,
                 )
         else:
             logger.debug("NAV cooldown active for sig=%s", sig[:8])
@@ -3116,15 +3387,19 @@ class WorkflowRunner:
                     sig,
                     {
                         "state_sig": sig,
+                        "app_intro": self.app_intro,
+                        "focus_hints": self.focus_hints,
                         "router_question_count": len(router_questions),
                         "enqueue_ts": self._block_router_enqueue_ts[sig],
                     },
                 )
                 self._block_router_futures[sig] = self._pool.submit(
                     self.gpt.propose_router_answers,
-                    snap.get("screenshot", ""),
-                    router_questions,
-                    sig,
+                    screenshot_b64=snap.get("screenshot", ""),
+                    router_questions=router_questions,
+                    app_intro=self.app_intro,
+                    focus_hints=self.focus_hints,
+                    state_sig=sig,
                 )
             else:
                 try:
@@ -3242,6 +3517,8 @@ class WorkflowRunner:
             sig,
             {
                 "state_sig": sig,
+                "app_intro": self.app_intro,
+                "focus_hints": self.focus_hints,
                 "block_count": len(matched_blocks),
                 "block_ids": block_ids,
                 "enqueue_ts": now,
@@ -3249,9 +3526,11 @@ class WorkflowRunner:
         )
         self._blocks_fill_futures[sig] = self._pool.submit(
             self.gpt.propose_blocks_fill,
-            snap.get("screenshot", ""),
-            matched_blocks,
-            sig,
+            screenshot_b64=snap.get("screenshot", ""),
+            blocks_payload=matched_blocks,
+            app_intro=self.app_intro,
+            focus_hints=self.focus_hints,
+            state_sig=sig,
         )
 
     def _drain_futures(self) -> None:
@@ -6364,15 +6643,15 @@ class WorkflowRunner:
             return True
         return False
 
-    def _stop_condition(self, start: float) -> bool:
+    def _stop_condition_reason(self, start: float) -> str:
         if (time.time() - start) >= self.budget.time_budget_s:
-            return True
+            return "time_budget_reached"
         # Hard stop if we haven't made strong progress for too long (prevents infinite recover loops).
         if float(self.budget.strong_stall_stop_s or 0.0) > 0.0:
             if (time.time() - float(self.last_strong_progress_ts or 0.0)) >= float(self.budget.strong_stall_stop_s):
-                return True
+                return "strong_stall_timeout"
         if self.action_count >= self.budget.max_actions:
-            return True
+            return "max_actions_reached"
         if self.no_new_state_count >= self.budget.saturation_limit:
-            return True
-        return False
+            return "state_saturation_reached"
+        return ""

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 import os
 import sys
 import time
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from appium_android import AndroidAppiumClient
 from gpt_cls import GPTClient
@@ -16,6 +20,20 @@ from trace_callbacks import InteractiveDebugCallbacks, JsonlTraceCallbacks, NoOp
 
 from dotenv import load_dotenv
 load_dotenv()
+
+
+_META_SELECTED_FIELDS = [
+    "description",
+    "descriptionHTML",
+    "summary",
+    "contentRating",
+    "contentRatingDescription",
+    "offersIAP",
+    "inAppProductPrice",
+    "genre",
+    "genreId",
+    "categories",
+]
 
 
 def setup_logging(debug: bool, level: str, *, quiet_console: bool = False):
@@ -53,6 +71,45 @@ def build_restart(appium: AndroidAppiumClient, package: str, activity: str, wait
     return restart
 
 
+def _read_csv_rows(csv_path: Path) -> list[Dict[str, Any]]:
+    encodings = ("utf-8-sig", "utf-8", "gb18030")
+    last_err: Optional[Exception] = None
+    for enc in encodings:
+        try:
+            with csv_path.open("r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                return [dict(row) for row in reader]
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Failed to read CSV: {csv_path} ({last_err})")
+
+
+def _find_metadata_row_by_app_id(rows: list[Dict[str, Any]], app_id: str) -> Optional[Dict[str, Any]]:
+    target = str(app_id or "").strip()
+    for row in rows:
+        if str(row.get("appId", "")).strip() == target:
+            return row
+    return None
+
+
+def _pick_metadata_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in _META_SELECTED_FIELDS:
+        out[key] = row.get(key, "")
+    return out
+
+
+def _normalize_questionnaire_type(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"games", "game"}:
+        return "games"
+    if raw in {"social", "social_apps", "social-apps", "socialapps"}:
+        return "social_apps"
+    if raw in {"others", "other"}:
+        return "others"
+    return ""
+
+
 def parse_args(argv) -> argparse.Namespace:
     # CLI supports the main exploration run plus lightweight device utilities.
     p = argparse.ArgumentParser(description="Run Appium + LLM exploration workflow or device utilities.")
@@ -64,6 +121,24 @@ def parse_args(argv) -> argparse.Namespace:
     run.add_argument("--package", type=str, required=True, help="Target app package name")
     run.add_argument("--activity", type=str, default=None, help="Optional launch activity")
     run.add_argument("--questionnaire-dir", type=str, required=True, help="Directory containing questionnaire JSON files")
+    run.add_argument(
+        "--questionnaire-type-source",
+        type=str,
+        default="manual",
+        choices=["manual", "metadata", "auto"],
+        help=(
+            "Choose questionnaire type source. "
+            "manual: always use --questionnaire-dir; "
+            "metadata: prefer metadata inferred type then fallback manual; "
+            "auto: same fallback behavior but intended as recommended default."
+        ),
+    )
+    run.add_argument(
+        "--metadata-csv-path",
+        type=str,
+        default="",
+        help="Optional metadata CSV path (must contain appId). If set, metadata summary runs before exploration.",
+    )
 
     run.add_argument("--task", type=str, default="Explore the app to fill the questionnaire.", help="Exploration goal string")
     run.add_argument("--relaunch", action="store_true", help="Relaunch app each time and kill once finished")
@@ -125,7 +200,8 @@ def parse_args(argv) -> argparse.Namespace:
 
 # package = "com.calcitem.sanmill"
 # package = "bim.app"
-package = "com.marktka.calculatorYou"
+# package = "com.marktka.calculatorYou"
+package = "bim.app"
 
 
 sys.argv = [sys.argv[0], 
@@ -160,12 +236,85 @@ def main(argv=None):
         if not api_key:
             logging.getLogger(__name__).warning("OPENAI_API_KEY not set; GPT calls will fail.")
 
+        # Init GPT client first because metadata summarization also uses LLM.
+        gpt = GPTClient(api_key=api_key, model=args.model, temperature=args.temperature, timeout_s=args.timeout)
+
+        manual_questionnaire_dir = str(args.questionnaire_dir)
+        questionnaire_type_source = str(getattr(args, "questionnaire_type_source", "manual") or "manual").strip().lower()
+        metadata_csv_path = str(getattr(args, "metadata_csv_path", "") or "").strip()
+        metadata_entry_found = False
+        metadata_notes = ""
+        app_intro: Optional[str] = None
+        focus_hints: Optional[str] = None
+        metadata_questionnaire_type = ""
+
+        # Metadata pre-analysis (before workflow run).
+        if metadata_csv_path:
+            try:
+                csv_path = Path(metadata_csv_path).resolve()
+                if not csv_path.exists():
+                    metadata_notes = f"metadata_csv_not_found:{csv_path}"
+                    logger.warning("Metadata CSV not found: %s", csv_path)
+                else:
+                    rows = _read_csv_rows(csv_path)
+                    row = _find_metadata_row_by_app_id(rows, args.package)
+                    if row is None:
+                        metadata_notes = f"appId_not_found_in_csv:{args.package}"
+                        logger.warning("Metadata CSV has no appId=%s; fallback to manual questionnaire type.", args.package)
+                    else:
+                        metadata_entry_found = True
+                        selected_meta = _pick_metadata_fields(row)
+                        meta_result = gpt.analyze_app_metadata(app_id=args.package, app_metadata=selected_meta)
+                        app_intro = (str(meta_result.app_intro or "").strip() or None)
+                        focus_hints = (str(meta_result.focus_hints or "").strip() or None)
+                        metadata_questionnaire_type = _normalize_questionnaire_type(str(meta_result.questionnaire_type or ""))
+                        metadata_notes = str(meta_result.notes or "").strip()
+                        logger.info(
+                            "Metadata analyzed app=%s questionnaire_type=%s intro=%s hints=%s",
+                            args.package,
+                            metadata_questionnaire_type or "-",
+                            bool(app_intro),
+                            bool(focus_hints),
+                        )
+            except Exception as e:
+                metadata_notes = f"metadata_analysis_failed:{type(e).__name__}:{e}"
+                logger.warning("Metadata analysis failed: %s", e)
+        else:
+            metadata_notes = "metadata_csv_path_not_set"
+
+        selected_questionnaire_type = _normalize_questionnaire_type(Path(manual_questionnaire_dir).resolve().name)
+        selected_questionnaire_dir = manual_questionnaire_dir
+
+        # questionnaire_type source switch:
+        # - manual: always manual dir/type
+        # - metadata/auto: try metadata type, fallback manual if unavailable
+        if questionnaire_type_source in {"metadata", "auto"}:
+            if metadata_questionnaire_type:
+                candidate_dir = Path(manual_questionnaire_dir).resolve().parent / metadata_questionnaire_type
+                if candidate_dir.exists():
+                    selected_questionnaire_dir = str(candidate_dir)
+                    selected_questionnaire_type = metadata_questionnaire_type
+                else:
+                    logger.warning(
+                        "Metadata questionnaire dir not found: %s. Fallback manual dir=%s",
+                        candidate_dir,
+                        manual_questionnaire_dir,
+                    )
+            else:
+                logger.warning(
+                    "Metadata questionnaire_type unavailable. Fallback manual dir=%s",
+                    manual_questionnaire_dir,
+                )
+
         # Load the UI-level router/block questionnaire state.
         # This replaces the old tree-state workflow; block_status is the main
         # runtime questionnaire signal.
-        q = QuestionnaireState2.load_from_questionnaire_dir(args.questionnaire_dir)
+        q = QuestionnaireState2.load_from_questionnaire_dir(selected_questionnaire_dir)
         logger.info(
-            "Loaded questionnaire_state2: routers=%d blocks=%d block_status=%d",
+            "Loaded questionnaire_state2: dir=%s type=%s source=%s routers=%d blocks=%d block_status=%d",
+            selected_questionnaire_dir,
+            selected_questionnaire_type,
+            questionnaire_type_source,
             len(q.routers),
             len(q.blocks),
             len(q.block_status),
@@ -173,9 +322,6 @@ def main(argv=None):
 
         # Init appium
         appium = AndroidAppiumClient(server_url=args.appium_url, device_name=args.device_name).init_connection()
-
-        # Init GPT client
-        gpt = GPTClient(api_key=api_key, model=args.model, temperature=args.temperature, timeout_s=args.timeout)
 
         budget = BudgetConfig(
             time_budget_s=float(args.time_budget),
@@ -201,6 +347,13 @@ def main(argv=None):
             target_package=args.package,
             target_activity=args.activity,
             pause=args.pause,
+            app_intro=app_intro,
+            focus_hints=focus_hints,
+            questionnaire_type=selected_questionnaire_type,
+            questionnaire_type_source=questionnaire_type_source,
+            metadata_csv_path=metadata_csv_path,
+            metadata_entry_found=metadata_entry_found,
+            metadata_notes=metadata_notes,
             callbacks=callbacks,
             run_id=getattr(callbacks, "run_id", args.run_id or ""),
         )
@@ -208,9 +361,43 @@ def main(argv=None):
         if args.relaunch and args.package:
             appium.force_stop(args.package)
 
+        run_started_at = time.time()
+        run_elapsed_s = 0.0
         try:
             runner.run(task=args.task)
         finally:
+            run_elapsed_s = float(time.time() - run_started_at)
+            usage_summary = {}
+            try:
+                usage_summary = gpt.usage_summary() if hasattr(gpt, "usage_summary") else {}
+            except Exception:
+                usage_summary = {}
+
+            logger.info("Run finished: elapsed_s=%.3f", run_elapsed_s)
+            logger.info("LLM token usage summary: %s", json.dumps(usage_summary, ensure_ascii=False))
+            print(f"[RUN] elapsed_seconds={run_elapsed_s:.3f}")
+            if usage_summary:
+                print(
+                    "[TOKENS] calls={calls} prompt={prompt} completion={completion} total={total}".format(
+                        calls=int(usage_summary.get("calls", 0) or 0),
+                        prompt=int(usage_summary.get("prompt_tokens", 0) or 0),
+                        completion=int(usage_summary.get("completion_tokens", 0) or 0),
+                        total=int(usage_summary.get("total_tokens", 0) or 0),
+                    )
+                )
+                by_op = usage_summary.get("by_op", {}) or {}
+                for op_name in sorted(by_op.keys()):
+                    row = by_op.get(op_name, {}) or {}
+                    print(
+                        "[TOKENS][{op}] calls={calls} prompt={prompt} completion={completion} total={total}".format(
+                            op=op_name,
+                            calls=int(row.get("calls", 0) or 0),
+                            prompt=int(row.get("prompt_tokens", 0) or 0),
+                            completion=int(row.get("completion_tokens", 0) or 0),
+                            total=int(row.get("total_tokens", 0) or 0),
+                        )
+                    )
+
             if args.relaunch and args.package:
                 appium.force_stop(args.package)
             appium.quit()
