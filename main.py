@@ -195,13 +195,13 @@ def parse_args(argv) -> argparse.Namespace:
     return p.parse_args(argv)
 
 #============================  # Dev-default args for quick local run; comment out in production.
-#package = "com.cs.cinemain"
-# package = "com.android.settings"
+#package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
 
-# package = "com.calcitem.sanmill"
-# package = "bim.app"
-# package = "com.marktka.calculatorYou"
-package = "bim.app"
+# package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
+package = "com.netease.a13.avg"
 
 
 sys.argv = [sys.argv[0], 
@@ -427,3 +427,9 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
