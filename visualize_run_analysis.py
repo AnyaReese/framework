@@ -77,9 +77,20 @@ def _load_sig_to_screenshot(trace_path: Path) -> Dict[str, str]:
                 continue
             data = row.get("data") or {}
             sig = str(data.get("state_sig") or "").strip()
+            # Prefer annotated vid_map overlay for UTG nodes.
+            # Fallback order: vid_map overlay -> processed screenshot -> raw screenshot.
+            shot_vid = str(data.get("vidmap_overlay_path") or "").strip()
             shot = str(data.get("screenshot_path") or "").strip()
-            if sig and shot and sig not in mapping:
-                mapping[sig] = shot
+            shot_raw = str(data.get("screenshot_raw_path") or "").strip()
+            chosen = ""
+            for cand in (shot_vid, shot, shot_raw):
+                if cand and Path(cand).exists():
+                    chosen = cand
+                    break
+            if not chosen:
+                chosen = shot_vid or shot or shot_raw
+            if sig and chosen and sig not in mapping:
+                mapping[sig] = chosen
     return mapping
 
 

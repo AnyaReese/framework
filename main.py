@@ -195,13 +195,13 @@ def parse_args(argv) -> argparse.Namespace:
     return p.parse_args(argv)
 
 #============================  # Dev-default args for quick local run; comment out in production.
-#package = "com.cs.cinemain"
-# package = "com.android.settings"
+#package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
 
-# package = "com.calcitem.sanmill"
-# package = "bim.app"
-# package = "com.marktka.calculatorYou"
-package = "bim.app"
+# package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
+# package = "com.netease.a13.avg"
+package = "com.maimemo.android.momo"
 
 
 sys.argv = [sys.argv[0], 
@@ -214,6 +214,7 @@ sys.argv = [sys.argv[0],
             "--questionnaire-dir", "./questionnaire-v2/games",
             "--trace-dir", "./traces/",
             "--run-id", time.strftime("%Y%m%d_%H%M%S") + "_" + package,
+            "--time-budget", "180",
             #"--pause",
             # "--interactive-debug",
             "--disable-probe-return",
@@ -427,3 +428,9 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+

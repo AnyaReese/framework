@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 # ============================
 # package = "bim.app"
 # package="com.Polystation.BuildABabe"
-package="com.sinyee.babybus.icecream"
+package="com.netease.uu"
 sys.argv = [
     sys.argv[0],
     # "--appium-url", "http://localhost:4723",

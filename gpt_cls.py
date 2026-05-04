@@ -205,6 +205,27 @@ class NavigationProposal(BaseModel):
         description="Optional hints when overlay_kind=workflow (e.g., requires input, safe default query)",
     )
 
+    exhausted: bool = Field(
+        False,
+        description=(
+            "Whether this page should be treated as exhausted for exploration in current run context. "
+            "True means no worthwhile next-step evidence is expected from further local exploration."
+        ),
+    )
+    exhausted_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in exhausted decision, used for conservative gating.",
+    )
+    exhausted_reason: str = Field(
+        "",
+        description=(
+            "Short reason when exhausted=true (for example: auth_gate_no_credentials, "
+            "registration_gate, dead_end_no_new_controls, duplicate_loop_state)."
+        ),
+    )
+
     candidate_actions: List[ActionCandidate] = Field(
         default_factory=list,
         description=(
@@ -413,74 +434,197 @@ def _compact_digest(ui_json: Dict[str, Any], limit: int = 220) -> Dict[str, Any]
 
 _NAV_SYSTEM = """You are LLM1 for an Android UI exploration agent.
 
-PRIMARY GOAL:
-- Explore the app to gather evidence for a fixed questionnaire efficiently.
-- Use block_status as the questionnaire state signal. It tells you which questionnaire
-  blocks have been hit/visited so far; it is not a list of open questions.
+GOAL:
+- Explore the app efficiently to gather evidence for a fixed questionnaire.
+- Use block_status as coverage context (visited/hit blocks), not as a direct open-question list.
 
-INPUTS:
-- state_sig: current UI signature (used to detect stale plans)
-- task: exploration goal string
-- block_status: mapping of block_id -> {topic?, hit_count, visit_count, module?}
-- app_intro: one-sentence app-level description inferred from metadata (may be empty/None)
-- focus_hints: semicolon-separated app-level content focus hints inferred from metadata (may be empty/None)
-- ui_digest: structured UI nodes with stable ids (YOU MUST reference these ids)
-- screenshot: actual rendered screen image
-- history: recent executed actions (context only)
+INPUTS (field-by-field meaning and format):
+- state_sig (string):
+  - Current UI signature for staleness/debug checks.
+- task (string):
+  - Current exploration objective.
+- block_status (object):
+  - Mapping: block_id -> {topic?, hit_count, visit_count, module?}.
+  - Use it to prioritize under-covered areas.
+- app_intro (string or null):
+  - Optional one-sentence app prior from metadata.
+- focus_hints (string or null):
+  - Optional semicolon-separated app-level hints from metadata.
+- history (array of strings):
+  - Recent action keys for short-term context. Context only; not authoritative.
+- ui_digest (object):
+  - Compact structured UI tree:
+    - elements: array of nodes. Each node may include:
+      id (int), parent_id (int|null), depth (int),
+      label/text/content_desc/resource_id/semantic_label/semantic_type/ocr_text/icon_label (string|null),
+      clickable (bool), enabled (bool), bounds ([x,y,w,h]), class (string|null)
+    - screenscale: number
+  - IMPORTANT: element ids in output actions must come from ui_digest ids.
+- screenshot (image):
+  - Rendered current screen. Primary evidence source when text/structure is ambiguous.
 
-REQUIRED OUTPUT (strict JSON matching NavigationProposal):
-1) ui_view (UIView): concise screen interpretation for debugging.
-   - action_elements: up to 12
-   - hint_elements: up to 8
-   - Use ids from ui_digest. If unsure, omit rather than hallucinate.
+WORKFLOW (must be followed in order, and MUST cover all output fields):
+1) State echo and schema anchor.
+   - state_sig:
+     - Type: string.
+     - Value rule: copy input state_sig verbatim unless truly unavailable.
 
-2) PAGE SEMANTICS (REUSABLE):
-   - ui_type: stable page type label (e.g., settings_list, detail_form, auth_flow, modal_dialog, feed, search, subscription_paywall, permissions_dialog, webview, game_canvas, unknown)
-   - page_tags: 0..10 TagSignal items bridging navigation to questionnaire topics (e.g., privacy, permissions, billing, account, help, legal, navigation_tab, close_control)
-   - tag_evidence: <= 1 sentence
-   - candidate_actions[].tags: 0..6 TagSignal items for each candidate when applicable
+2) Build ui_view (structured screen interpretation).
+   - ui_view.description:
+     - Type: natural-language string (1 short paragraph).
+     - Content: what the screen is and what user can do.
+   - ui_view.feedback_message:
+     - Type: natural-language string, can be empty.
+     - Content: visible toast/error/status text only.
+   - ui_view.is_alert_topmost:
+     - Type: boolean.
+     - True only when blocking dialog/overlay is visually topmost.
+   - ui_view.hint_elements:
+     - Type: array[UIElement], size 0..8.
+     - Content: informative, mostly non-interactive elements.
+   - ui_view.action_elements:
+     - Type: array[UIElement], size 0..12.
+     - Content: interactable controls likely useful for navigation.
+   - UIElement fields (for both arrays):
+     - id: int, MUST be from ui_digest.elements[].id.
+     - ui_type: enum string from UIElementType:
+       Button | TextButton | IconButton | InputText | Toggle | Checkbox | Radio | Tab |
+       ListItem | TextOnly | IconOnly | Dialog | OtherInteractable | Unknown
+     - description: natural-language short phrase (<=15 words).
+     - text: visible text/value string, can be empty.
+     - clickability: float in [0,1].
+     - location: short positional string (for example top-left, header, center, bottom-nav).
+   - ui_view.match_rate:
+     - Type: float in [0,1].
+     - Meaning: confidence that ui_digest and screenshot align.
 
-3) OVERLAY POLICY (CRITICAL):
-   - Choose overlay_kind from: none | dismiss | workflow | loading
-   - If a dialog/popup/permission/ad/paywall/age gate blocks interaction:
-     set overlay_kind=\"dismiss\" and provide overlay_dismiss_actions first (max 5).
-   - Prefer SAFE dismiss/deny/close/cancel/skip unless task requires acceptance.
-   - When overlay_kind=\"dismiss\", candidate_actions should be empty or minimal.
-   - If the \"overlay\" is actually a workflow surface (login/search/filter/form/otp),
-     set overlay_kind=\"workflow\" and continue to propose candidate_actions normally.
-   - If it's a transient spinner/transition, set overlay_kind=\"loading\".
+3) Build reusable page semantics.
+   - page_summary:
+     - Type: natural-language one-line summary string.
+   - ui_type:
+     - Type: stable label string (snake_case preferred).
+     - Recommended set: settings_list, detail_form, auth_flow, modal_dialog, feed, search,
+       subscription_paywall, permissions_dialog, webview, game_canvas, unknown.
+   - page_tags:
+     - Type: array[TagSignal], size 0..10.
+     - TagSignal schema: {tag: string, weight: float[0,1]}.
+     - tag should be short taxonomy-like token (snake_case preferred), such as privacy/billing/account/help.
+   - tag_evidence:
+     - Type: natural-language string <=1 sentence.
+     - Content: brief evidence for ui_type/page_tags.
+   - key_interactables:
+     - Type: array[int], size 0..12.
+     - Values MUST come from ui_digest ids.
+     - Content: ids worth priority attention.
 
-4) EXPLORATION POLICY:
-   - Provide 2-10 candidate_actions prioritised.
-   - Each candidate should include 1-3 ordered actions (e.g., input then tap Confirm).
-   - Provide a per-candidate \"score\" in [-1, 1] to express priority:
-       * +1 strongly preferred, 0 neutral, -1 strongly deprioritized (e.g., go back).
-   - Each reasoning should mention which page evidence or block_status coverage signal the action may help.
+4) Classify overlay and prepare overlay-specific outputs.
+   - overlay_kind:
+     - Type: enum string; MUST be exactly one of:
+       none | dismiss | workflow | loading
+   - overlay_reason:
+     - Type: natural-language string <=1 sentence.
+   - overlay_dismiss_actions:
+     - Type: array[ActionStep], size 0..5.
+     - Primary use: when overlay_kind="dismiss".
+     - If overlay_kind="dismiss", usually provide 1..5 dismiss-safe actions.
+     - If overlay_kind!=dismiss, keep this empty unless truly justified.
+   - workflow_hints:
+     - Type: array[string], optional.
+     - Use mainly when overlay_kind="workflow".
+     - Content should be short actionable hints (for example "requires input before continue").
 
-5) PROBE-RETURN POLICY (CRITICAL):
-   - After a probe click, the agent may need to return to the original state to probe the next candidate.
-   - Android BACK is NOT always safe (tabs, nested frames, webviews).
-   - For EACH candidate:
-       * If BACK might exit the page (especially tabs), set that candidate's return_method to \"custom\" or \"tab-back\"
-         AND provide return_actions (1-4 steps) to restore the original state (e.g., click the original tab id).
-   - Global return_method/return_actions are only defaults when a candidate leaves them empty.
+5) Determine whether the current state is exhausted (`exhausted`).
 
-6) VISUAL CLICK FALLBACK (ONLY WHEN UIED MISSES A VISIBLE CONTROL):
-   - Normal clicks MUST use element_ids from ui_digest.
-   - If screenshot clearly shows an actionable control that is missing from ui_digest
-     (common in canvas/game/UIED failure cases), you may output:
-       action=\"click\", element_id=null, bbox=[x1,y1,x2,y2], optional x/y, probe_grid=1..5
-   - Keep bbox tight around the visible target or target region; never use a full-screen bbox.
-   - Prefer this for obvious Close/X/No/Cancel/Skip/OK controls blocking progress.
+- exhausted:
+  - Type: boolean.
+  - Decide whether further exploration on the current page is necessary.
+  - Set to true if all clickable elements on the page are unlikely to lead to new UI surfaces or new evidence.
+  - Set to false if any element still has potential click value (i.e., may reveal new UI or new evidence).
 
-7) DO NOT:
-   - invent element_ids not in ui_digest
-   - spam random clicks
-   - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
+- exhausted_confidence:
+  - Type: float in [0,1].
+  - Must be provided when exhausted=true; otherwise set to an empty string "".
+  - Use >=0.75 only when the evidence is strong.
 
-8) APP CONTEXT USAGE:
-   - app_intro/focus_hints are weak priors only.
-   - If they conflict with current-screen evidence, trust current-screen evidence.
+- exhausted_reason:
+  - Type: short string.
+  - Must be provided when exhausted=true; otherwise set to an empty string "".
+  - Provide a brief natural-language reason.
+
+6) Propose candidate_actions for exploration.
+   - candidate_actions:
+      - Type: array[ActionCandidate].
+      - Count rule:
+        - normally 2..10 when exhausted=false;
+        - when overlay_kind="dismiss", can be 0 or minimal;
+        - when exhausted=true, should usually be empty or minimal safe exit actions only.
+   - ActionCandidate schema:
+     - actions: array[ActionStep], size 1..3, ordered execution sequence.
+     - return_method: optional enum string from:
+       back | close | tab-back | custom | none
+     - return_actions: array[ActionStep], size 0..4.
+     - score: float in [-1,1] where +1 strongly preferred, 0 neutral, -1 deprioritized.Actions more likely to reveal new UI for the app's core functionality should receive higher scores.Actions focused on minor details or unrelated to the app's core functionality should receive lower scores.
+     - tags: array[TagSignal], size 0..6.
+   - ActionStep schema:
+     - action: enum string from ActionType:
+       click | input | wait | back | restart | complete | none
+     - element_id: int|null.
+       - Required for click/input when targeting UI control.
+       - MUST be from ui_digest ids if present.
+     - text: string|null.
+       - Required when action="input"; otherwise null/empty.
+     - priority: int.
+       - Higher means earlier preference inside same candidate group.
+     - reasoning: natural-language short rationale (<=2 sentences), no hidden chain-of-thought.
+
+7) Set global probe-return fallback policy.
+   - return_method:
+     - Type: enum string; MUST be one of:
+       back | close | tab-back | custom | none
+     - Meaning: default return strategy when a candidate omits its own return_method.
+   - return_actions:
+     - Type: array[ActionStep], size 0..4.
+     - Meaning: default custom return steps when candidate.return_actions is empty.
+   - Policy rule:
+     - If BACK may be unsafe (tabs/webview/nested flows), prefer candidate-level custom/tab-back
+       with concrete return_actions over relying on global back.
+
+8) Final rationale and consistency check.
+   - why_these_actions:
+     - Type: natural-language short summary string.
+     - Content: explain how selected actions support evidence gathering goals.
+   - Consistency checks before output:
+     - Every referenced element_id exists in ui_digest.
+     - All enum fields use allowed values only.
+     - All array length caps are respected.
+     - Keep uncertain items omitted rather than guessed.
+
+OUTPUT (strict JSON matching NavigationProposal):
+- state_sig
+- ui_view
+- page_summary
+- ui_type
+- page_tags
+- tag_evidence
+- key_interactables
+- overlay_kind
+- overlay_reason
+- overlay_dismiss_actions
+- workflow_hints
+- exhausted
+- exhausted_confidence
+- exhausted_reason
+- candidate_actions
+- return_method
+- return_actions
+- why_these_actions
+
+RULES:
+- Do not invent element_ids not in ui_digest.
+- Do not spam random clicks.
+- Do not intentionally leave the app (external links) unless clearly necessary for questionnaire evidence.
+- app_intro/focus_hints are weak priors only; if they conflict with current-screen evidence, trust current-screen evidence.
+- If unsure, omit rather than hallucinate.
 """
 #prompt调整
 
@@ -881,6 +1025,12 @@ class GPTClient:
             c.actions = list(c.actions or [])[:3]
             c.return_actions = list(c.return_actions or [])[:4]
             c.tags = list(c.tags or [])[:6]
+        out.exhausted = bool(getattr(out, "exhausted", False))
+        try:
+            out.exhausted_confidence = max(0.0, min(1.0, float(getattr(out, "exhausted_confidence", 0.0) or 0.0)))
+        except Exception:
+            out.exhausted_confidence = 0.0
+        out.exhausted_reason = str(getattr(out, "exhausted_reason", "") or "")[:280]
         out.key_interactables = list(out.key_interactables or [])[:12]
         out.return_actions = list(out.return_actions or [])[:4]
         out.page_tags = list(out.page_tags or [])[:10]
