@@ -201,7 +201,7 @@ def parse_args(argv) -> argparse.Namespace:
 # package = "com.netease.a13.avg"
 # package = "com.netease.a13.avg"
 # package = "com.netease.a13.avg"
-package = "com.netease.a13.avg"
+package = "com.maimemo.android.momo"
 
 
 sys.argv = [sys.argv[0], 
@@ -214,6 +214,7 @@ sys.argv = [sys.argv[0],
             "--questionnaire-dir", "./questionnaire-v2/games",
             "--trace-dir", "./traces/",
             "--run-id", time.strftime("%Y%m%d_%H%M%S") + "_" + package,
+            "--time-budget", "180",
             #"--pause",
             # "--interactive-debug",
             "--disable-probe-return",

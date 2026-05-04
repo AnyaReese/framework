@@ -99,7 +99,7 @@ class BudgetConfig:
     post_action_settle_s: float = 0.6
 
     # NAV barrier (wait + drift detection + timeout fallback)
-    nav_timeout_s: float = 30# LLM1检测等待最长时间
+    nav_timeout_s: float = 120.0  # LLM1 wait timeout before heuristic fallback
     nav_poll_interval_s: float = 0.08
     nav_drift_check_interval_s: float = 0.9# 每隔多久进行一次drift检测
     nav_cooldown_s: float = 6.0
@@ -1462,6 +1462,45 @@ class WorkflowRunner:
             # 从 NAV 结果里提取当前页面的 overlay 类型，后面按类型分流处理。
             overlay_kind = self._overlay_kind_value(nav)
 
+            nav_exhausted = False
+            nav_exhausted_conf = 0.0
+            nav_exhausted_reason = ""
+            if nav is not None:
+                try:
+                    nav_exhausted = bool(getattr(nav, "exhausted", False))
+                    nav_exhausted_conf = float(getattr(nav, "exhausted_confidence", 0.0) or 0.0)
+                    nav_exhausted_reason = str(getattr(nav, "exhausted_reason", "") or "")
+                except Exception:
+                    nav_exhausted = False
+                    nav_exhausted_conf = 0.0
+                    nav_exhausted_reason = ""
+
+            # Honor exhausted only with strong confidence to avoid false positives.
+            if nav_exhausted and nav_exhausted_conf >= 0.75:
+                fam = self._family_id(cur_sig)
+                self.state_candidates[fam] = []
+                self._log_event(
+                    "nav_exhausted",
+                    sig=cur_sig,
+                    exhausted=True,
+                    exhausted_confidence=nav_exhausted_conf,
+                    exhausted_reason=nav_exhausted_reason[:220],
+                    ui_type=str(getattr(nav, "ui_type", "") or "") if nav else "",
+                    overlay_kind=overlay_kind,
+                    candidate_count=len(getattr(nav, "candidate_actions", []) or []) if nav else 0,
+                )
+                self._emit_decision(
+                    cur_sig,
+                    "nav_exhausted",
+                    {
+                        "exhausted": True,
+                        "confidence": nav_exhausted_conf,
+                        "reason": nav_exhausted_reason[:220],
+                        "ui_type": str(getattr(nav, "ui_type", "") or "") if nav else "",
+                        "overlay_kind": overlay_kind,
+                    },
+                )
+
             # CONDITION: OVERLAY (blocking dismiss / loading)
             # 如果当前页面被可关闭弹窗阻塞，先优先处理弹窗，而不是继续正常探索。
             if overlay_kind == OverlayKind.DISMISS.value:
@@ -1522,7 +1561,10 @@ class WorkflowRunner:
 
             # Candidates: NAV if available; heuristics ONLY if NAV timed out/cooldown.
             # 生成本轮可尝试的候选动作；优先使用 NAV 结果，只有 NAV 不可用时才退化到启发式。
-            candidates = self._candidate_actions(nav=nav, snap=snap, allow_heuristics=using_heuristics)
+            if nav_exhausted and nav_exhausted_conf >= 0.75:
+                candidates = []
+            else:
+                candidates = self._candidate_actions(nav=nav, snap=snap, allow_heuristics=using_heuristics)
             self._emit_decision(
                 cur_sig,
                 "next_step",
@@ -1534,7 +1576,7 @@ class WorkflowRunner:
                 },
             )
             # 如果本轮拿到的是正常 NAV 结果，就顺手检查候选是否还有真正可用的动作。
-            if nav is not None and (not using_heuristics):
+            if nav is not None and (not using_heuristics) and not (nav_exhausted and nav_exhausted_conf >= 0.75):
                 # 统计有没有至少一个候选动作还没被探索、尝试或拉黑。
                 usable = 0
                 # 逐个检查候选。
@@ -4208,7 +4250,8 @@ class WorkflowRunner:
                 logger.debug("Probe action failed immediately at src_sig=%s", src_sig[:8])
                 # Foreground mismatch is a STATE fault: stop probing and replan on a fresh snapshot.
                 try:
-                    if (self.last_action_failure or {}).get("reason") == "foreground_mismatch":
+                    fail_reason = (self.last_action_failure or {}).get("reason")
+                    if fail_reason in ("foreground_mismatch", "post_back_foreground_mismatch"):
                         snap2 = self._capture_and_process(timeout=6.0)
                         if snap2:
                             self._set_forced_replan(str(snap2.get("state_sig") or ""), snap2, has_edge=False)
@@ -4591,6 +4634,8 @@ class WorkflowRunner:
             nxt = apply_step(st, kind="return", why="back_fallback_primary")
             if (self.last_action_failure or {}).get("reason") == "back_blocked_settings_root":
                 return False
+            if (self.last_action_failure or {}).get("reason") == "post_back_foreground_mismatch":
+                return False
             if nxt and matches(nxt):
                 return True
 
@@ -4599,6 +4644,8 @@ class WorkflowRunner:
             st = ActionStep(action=ActionType.BACK, element_id=None, priority=1, reasoning="return_back_last")
             nxt = apply_step(st, kind="return", why="back_fallback_last_resort")
             if (self.last_action_failure or {}).get("reason") == "back_blocked_settings_root":
+                return False
+            if (self.last_action_failure or {}).get("reason") == "post_back_foreground_mismatch":
                 return False
             if nxt and matches(nxt):
                 return True
@@ -6481,6 +6528,40 @@ class WorkflowRunner:
                         return False
 
                 self.appium.back()
+
+                # Post-BACK foreground guard: BACK may exit target app (launcher/external app).
+                ok_pkg_after, pkg_after = self._foreground_is_allowed()
+                if not ok_pkg_after:
+                    self.foreground_mismatch_count += 1
+                    self.foreground_mismatch_streak += 1
+                    self._log_event(
+                        "foreground_mismatch_during_action",
+                        sig=sig_for_trace,
+                        action=self._action_signature(step),
+                        foreground_package=pkg_after,
+                        streak=self.foreground_mismatch_streak,
+                        total=self.foreground_mismatch_count,
+                        phase="post_back",
+                    )
+                    self.last_action_failure = {
+                        "reason": "post_back_foreground_mismatch",
+                        "foreground_package": pkg_after,
+                        "action": self._action_signature(step),
+                    }
+                    try:
+                        if self.target_package:
+                            self.appium.ensure_foreground(self.target_package, self.target_activity)
+                            self.foreground_recoveries += 1
+                    except Exception:
+                        pass
+                    self._emit_action(
+                        sig_for_trace,
+                        action_sig,
+                        "after",
+                        {"success": False, "reason": "post_back_foreground_mismatch", "foreground_package": pkg_after, **common_extra},
+                    )
+                    return False
+
                 self._emit_action(sig_for_trace, action_sig, "after", {"success": True, **common_extra})
                 return True
 

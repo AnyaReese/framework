@@ -184,6 +184,27 @@ class NavigationProposal(BaseModel):
         description="Optional hints when overlay_kind=workflow (e.g., requires input, safe default query)",
     )
 
+    exhausted: bool = Field(
+        False,
+        description=(
+            "Whether this page should be treated as exhausted for exploration in current run context. "
+            "True means no worthwhile next-step evidence is expected from further local exploration."
+        ),
+    )
+    exhausted_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in exhausted decision, used for conservative gating.",
+    )
+    exhausted_reason: str = Field(
+        "",
+        description=(
+            "Short reason when exhausted=true (for example: auth_gate_no_credentials, "
+            "registration_gate, dead_end_no_new_controls, duplicate_loop_state)."
+        ),
+    )
+
     candidate_actions: List[ActionCandidate] = Field(
         default_factory=list,
         description=(
@@ -491,18 +512,37 @@ WORKFLOW (must be followed in order, and MUST cover all output fields):
      - Use mainly when overlay_kind="workflow".
      - Content should be short actionable hints (for example "requires input before continue").
 
-5) Propose candidate_actions for exploration.
+5) Determine whether the current state is exhausted (`exhausted`).
+
+- exhausted:
+  - Type: boolean.
+  - Decide whether further exploration on the current page is necessary.
+  - Set to true if all clickable elements on the page are unlikely to lead to new UI surfaces or new evidence.
+  - Set to false if any element still has potential click value (i.e., may reveal new UI or new evidence).
+
+- exhausted_confidence:
+  - Type: float in [0,1].
+  - Must be provided when exhausted=true; otherwise set to an empty string "".
+  - Use >=0.75 only when the evidence is strong.
+
+- exhausted_reason:
+  - Type: short string.
+  - Must be provided when exhausted=true; otherwise set to an empty string "".
+  - Provide a brief natural-language reason.
+
+6) Propose candidate_actions for exploration.
    - candidate_actions:
-     - Type: array[ActionCandidate].
-     - Count rule:
-       - normally 2..10;
-       - when overlay_kind="dismiss", can be 0 or minimal.
+      - Type: array[ActionCandidate].
+      - Count rule:
+        - normally 2..10 when exhausted=false;
+        - when overlay_kind="dismiss", can be 0 or minimal;
+        - when exhausted=true, should usually be empty or minimal safe exit actions only.
    - ActionCandidate schema:
      - actions: array[ActionStep], size 1..3, ordered execution sequence.
      - return_method: optional enum string from:
        back | close | tab-back | custom | none
      - return_actions: array[ActionStep], size 0..4.
-     - score: float in [-1,1] where +1 strongly preferred, 0 neutral, -1 deprioritized.
+     - score: float in [-1,1] where +1 strongly preferred, 0 neutral, -1 deprioritized.Actions more likely to reveal new UI for the app's core functionality should receive higher scores.Actions focused on minor details or unrelated to the app's core functionality should receive lower scores.
      - tags: array[TagSignal], size 0..6.
    - ActionStep schema:
      - action: enum string from ActionType:
@@ -516,7 +556,7 @@ WORKFLOW (must be followed in order, and MUST cover all output fields):
        - Higher means earlier preference inside same candidate group.
      - reasoning: natural-language short rationale (<=2 sentences), no hidden chain-of-thought.
 
-6) Set global probe-return fallback policy.
+7) Set global probe-return fallback policy.
    - return_method:
      - Type: enum string; MUST be one of:
        back | close | tab-back | custom | none
@@ -528,7 +568,7 @@ WORKFLOW (must be followed in order, and MUST cover all output fields):
      - If BACK may be unsafe (tabs/webview/nested flows), prefer candidate-level custom/tab-back
        with concrete return_actions over relying on global back.
 
-7) Final rationale and consistency check.
+8) Final rationale and consistency check.
    - why_these_actions:
      - Type: natural-language short summary string.
      - Content: explain how selected actions support evidence gathering goals.
@@ -550,6 +590,9 @@ OUTPUT (strict JSON matching NavigationProposal):
 - overlay_reason
 - overlay_dismiss_actions
 - workflow_hints
+- exhausted
+- exhausted_confidence
+- exhausted_reason
 - candidate_actions
 - return_method
 - return_actions
@@ -945,6 +988,12 @@ class GPTClient:
             c.actions = list(c.actions or [])[:3]
             c.return_actions = list(c.return_actions or [])[:4]
             c.tags = list(c.tags or [])[:6]
+        out.exhausted = bool(getattr(out, "exhausted", False))
+        try:
+            out.exhausted_confidence = max(0.0, min(1.0, float(getattr(out, "exhausted_confidence", 0.0) or 0.0)))
+        except Exception:
+            out.exhausted_confidence = 0.0
+        out.exhausted_reason = str(getattr(out, "exhausted_reason", "") or "")[:280]
         out.key_interactables = list(out.key_interactables or [])[:12]
         out.return_actions = list(out.return_actions or [])[:4]
         out.page_tags = list(out.page_tags or [])[:10]

@@ -12,11 +12,9 @@ mytest2/llm1_debug/
 mytest2/preflight_refresh_test/
 mytest2/questionnaire_handler/chain_debug/
 mytests/outputs/uied_runtime/
-
-# Local scratch files
-test1.png
-test2.png
-test3.png
-test4.png
-test5.png
-test6.png
+4-30-debug
+5.2_app批量测试
+论文写作
+docs
+LLM图片交互测试
+.gitignore
