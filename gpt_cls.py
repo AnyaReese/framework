@@ -111,6 +111,27 @@ class ActionStep(BaseModel):
     action: ActionType = Field(..., description="Concrete action type")
     element_id: Optional[int] = Field(None, description="UI element id for click/input")
     text: Optional[str] = Field(None, description="Text to input when action==input")
+    x: Optional[int] = Field(
+        None,
+        description="Optional absolute screenshot x coordinate for visual click fallback when element_id is null",
+    )
+    y: Optional[int] = Field(
+        None,
+        description="Optional absolute screenshot y coordinate for visual click fallback when element_id is null",
+    )
+    bbox: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Optional absolute screenshot bbox [x1,y1,x2,y2] for bounded visual click probing "
+            "when an obvious target is missing from ui_digest and element_id is null"
+        ),
+    )
+    probe_grid: int = Field(
+        3,
+        ge=1,
+        le=5,
+        description="Grid size for bounded visual probing inside bbox when element_id is null",
+    )
     priority: int = Field(0, description="Higher executes earlier when same group")
     reasoning: str = Field("", description="Short rationale (<=2 sentences). No chain-of-thought.")
 
@@ -444,11 +465,20 @@ REQUIRED OUTPUT (strict JSON matching NavigationProposal):
          AND provide return_actions (1-4 steps) to restore the original state (e.g., click the original tab id).
    - Global return_method/return_actions are only defaults when a candidate leaves them empty.
 
-6) DO NOT:
-  - invent element_ids not in ui_digest
-  - spam random clicks
-  - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
-7) APP CONTEXT USAGE:
+6) VISUAL CLICK FALLBACK (ONLY WHEN UIED MISSES A VISIBLE CONTROL):
+   - Normal clicks MUST use element_ids from ui_digest.
+   - If screenshot clearly shows an actionable control that is missing from ui_digest
+     (common in canvas/game/UIED failure cases), you may output:
+       action=\"click\", element_id=null, bbox=[x1,y1,x2,y2], optional x/y, probe_grid=1..5
+   - Keep bbox tight around the visible target or target region; never use a full-screen bbox.
+   - Prefer this for obvious Close/X/No/Cancel/Skip/OK controls blocking progress.
+
+7) DO NOT:
+   - invent element_ids not in ui_digest
+   - spam random clicks
+   - leave the app intentionally (external links) unless clearly needed for questionnaire evidence
+
+8) APP CONTEXT USAGE:
    - app_intro/focus_hints are weak priors only.
    - If they conflict with current-screen evidence, trust current-screen evidence.
 """
@@ -739,6 +769,8 @@ OUTPUT (strict JSON matching RecoveryProposal):
 - candidate_actions <= 5
 - Allowed actions: click, input, back, wait, restart, none, complete
 - Choose overlay_kind from: none | dismiss | workflow | loading
+- If a visible recovery control is missing from ui_digest, a click may use element_id=null
+  with a tight absolute screenshot bbox=[x1,y1,x2,y2] and optional x/y for bounded visual probing.
 
 STRATEGY:
 1) If overlay likely, propose click actions on Close/X/Cancel/Deny/Not now/OK (safe first).
